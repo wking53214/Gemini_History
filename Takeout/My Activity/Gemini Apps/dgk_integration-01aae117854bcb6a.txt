@@ -1,0 +1,427 @@
+"""
+DGK Integration Layer
+=====================
+
+Optional multi-node consensus for critical governance decisions.
+Integrated into PERCEIVE as optional escalation path.
+
+Only used for:
+- Emergency overrides
+- Policy amendments
+- Critical rule changes
+"""
+
+from __future__ import annotations
+
+import json
+import hmac
+import hashlib
+import logging
+import math
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional
+from datetime import datetime, timezone
+
+logger = logging.getLogger("DGK_INTEGRATION")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(
+        "[DGK] %(asctime)s %(levelname)s %(message)s"
+    ))
+    logger.addHandler(handler)
+
+
+# ============================================================
+# UTILITIES
+# ============================================================
+
+def canonical_json(obj: Dict[str, Any]) -> str:
+    """Deterministic JSON serialization."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def public_view(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract only public fields (no internal state)."""
+    return {
+        k: v for k, v in state.items()
+        if not (isinstance(k, str) and k.startswith("_"))
+    }
+
+
+# ============================================================
+# SIGNING
+# ============================================================
+
+class Signer:
+    """HMAC signing for proposals."""
+
+    @staticmethod
+    def sign(payload: Dict[str, Any], key: bytes) -> str:
+        """Create HMAC signature."""
+        data = canonical_json(public_view(payload)).encode()
+        return hmac.new(key, data, hashlib.sha256).hexdigest()
+
+    @staticmethod
+    def verify(payload: Dict[str, Any], key: bytes) -> bool:
+        """Verify HMAC signature."""
+        sig = payload.get("_sig")
+        if not isinstance(sig, str):
+            return False
+        return hmac.compare_digest(sig, Signer.sign(payload, key))
+
+
+# ============================================================
+# PROPOSAL (FROM NODE)
+# ============================================================
+
+@dataclass
+class Proposal:
+    """Multi-node proposal for decision."""
+    node_id: str
+    decision: Dict[str, Any]  # The actual decision data
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    signature: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize for transmission."""
+        return {
+            "node_id": self.node_id,
+            "decision": self.decision,
+            "timestamp": self.timestamp.isoformat(),
+            "signature": self.signature,
+        }
+
+    def sign(self, key: bytes) -> None:
+        """Sign the proposal."""
+        payload = {
+            "node_id": self.node_id,
+            "decision": self.decision,
+            "timestamp": self.timestamp.isoformat(),
+        }
+        self.signature = Signer.sign(payload, key)
+
+
+# ============================================================
+# CLUSTERING (PROPOSAL AGGREGATION)
+# ============================================================
+
+def l1_distance(a: Dict[str, Any], b: Dict[str, Any]) -> float:
+    """L1 distance between two decisions (for clustering)."""
+    a_view = public_view(a)
+    b_view = public_view(b)
+    
+    keys = set(a_view) | set(b_view)
+    dist = 0.0
+    
+    for k in keys:
+        try:
+            a_val = float(a_view.get(k, 0))
+            b_val = float(b_view.get(k, 0))
+            dist += abs(a_val - b_val)
+        except (ValueError, TypeError):
+            # Non-numeric fields: exact match = 0 distance
+            if a_view.get(k) != b_view.get(k):
+                dist += 1.0
+    
+    return dist
+
+
+def cluster_proposals(
+    proposals: List[Proposal],
+    eps: float = 1e-6,
+) -> List[List[Proposal]]:
+    """
+    Cluster proposals by similarity.
+    Proposals within eps distance form a cluster.
+    """
+    clusters: List[List[Proposal]] = []
+    
+    for p in proposals:
+        placed = False
+        for c in clusters:
+            if l1_distance(p.decision, c[0].decision) <= eps:
+                c.append(p)
+                placed = True
+                break
+        
+        if not placed:
+            clusters.append([p])
+    
+    return clusters
+
+
+# ============================================================
+# CONSENSUS ENGINE (QUORUM-BASED)
+# ============================================================
+
+class ConsensusDecider:
+    """Multi-node consensus with quorum requirement."""
+
+    def __init__(self, quorum_fraction: float = 0.66):
+        """
+        quorum_fraction: minimum fraction of nodes that must agree (0.66 = 2/3).
+        """
+        self.quorum_fraction = quorum_fraction
+
+    def decide(
+        self,
+        proposals: List[Proposal],
+        key_map: Dict[str, bytes],
+    ) -> Dict[str, Any]:
+        """
+        Reach consensus on proposals from multiple nodes.
+        
+        Returns:
+            Consensus decision (the cluster winner)
+        
+        Raises:
+            RuntimeError: If verification fails or no quorum reached
+        """
+        
+        if not proposals:
+            raise RuntimeError("No proposals to decide on")
+        
+        # 1. Verify all proposals
+        for p in proposals:
+            if p.node_id not in key_map:
+                raise RuntimeError(f"Unknown node: {p.node_id}")
+            
+            # Reconstruct payload for verification
+            payload = {
+                "node_id": p.node_id,
+                "decision": p.decision,
+                "timestamp": p.timestamp.isoformat(),
+            }
+            
+            if not Signer.verify(payload, key_map[p.node_id]):
+                raise RuntimeError(f"Signature verification failed for {p.node_id}")
+        
+        logger.info(f"Verified {len(proposals)} proposals")
+        
+        # 2. Cluster by similarity
+        clusters = cluster_proposals(proposals, eps=1e-6)
+        logger.info(f"Clustered into {len(clusters)} groups")
+        
+        # 3. Check quorum
+        total = len(proposals)
+        min_votes = math.ceil(total * self.quorum_fraction)
+        
+        best_cluster = max(clusters, key=len)
+        
+        if len(best_cluster) < min_votes:
+            raise RuntimeError(
+                f"No quorum: {len(best_cluster)} votes < {min_votes} required "
+                f"(quorum {self.quorum_fraction:.0%} of {total})"
+            )
+        
+        logger.info(f"Quorum reached: {len(best_cluster)}/{total} nodes agreed")
+        
+        # 4. Pick canonical representative (sorted by node_id for determinism)
+        chosen_proposal = sorted(best_cluster, key=lambda p: p.node_id)[0]
+        
+        result = {
+            "decision": public_view(chosen_proposal.decision),
+            "consensus_size": len(best_cluster),
+            "total_proposals": total,
+            "quorum_fraction": self.quorum_fraction,
+            "leader_node": chosen_proposal.node_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        
+        return result
+
+
+# ============================================================
+# GOVERNANCE NODE (MULTI-NODE AWARE)
+# ============================================================
+
+class GovernanceNode:
+    """Represents a governance node in multi-node consensus."""
+
+    def __init__(self, node_id: str, key: bytes):
+        self.node_id = node_id
+        self.key = key
+
+    def propose(self, decision: Dict[str, Any]) -> Proposal:
+        """Create a proposal for consensus."""
+        proposal = Proposal(
+            node_id=self.node_id,
+            decision=decision,
+        )
+        proposal.sign(self.key)
+        logger.info(f"Node {self.node_id} proposed decision")
+        return proposal
+
+
+# ============================================================
+# DGK INTEGRATION LAYER (PLUGS INTO PERCEIVE)
+# ============================================================
+
+class DGKGateway:
+    """
+    Optional gateway to DGK consensus.
+    Used for critical decisions that require multi-node agreement.
+    """
+
+    def __init__(
+        self,
+        nodes: Dict[str, GovernanceNode],  # {node_id: node}
+        consensus_decider: ConsensusDecider,
+    ):
+        self.nodes = nodes
+        self.consensus_decider = consensus_decider
+
+    def require_consensus(
+        self,
+        request_type: str,
+        decision_data: Dict[str, Any],
+    ) -> bool:
+        """
+        Determine if this request requires multi-node consensus.
+        
+        Returns True for critical decisions only:
+        - emergency_override
+        - modify_critical_rule
+        - modify_safety_critical_rule
+        """
+        critical_types = {
+            "emergency_override",
+            "modify_critical_rule",
+            "modify_safety_critical_rule",
+        }
+        return request_type in critical_types
+
+    def gather_proposals(
+        self,
+        request_type: str,
+        decision_data: Dict[str, Any],
+    ) -> List[Proposal]:
+        """
+        Ask all nodes to propose a decision.
+        In practice, this would be distributed RPC.
+        For now, we simulate local node proposals.
+        """
+        proposals = []
+        
+        for node in self.nodes.values():
+            proposal = node.propose(decision_data)
+            proposals.append(proposal)
+        
+        logger.info(f"Gathered {len(proposals)} proposals from nodes")
+        return proposals
+
+    def reach_consensus(
+        self,
+        request_type: str,
+        decision_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Orchestrate multi-node consensus.
+        
+        Returns:
+            Consensus result with decision, quorum info, timestamp
+        """
+        
+        if not self.require_consensus(request_type):
+            raise ValueError(f"Request type {request_type} does not require consensus")
+        
+        # 1. Gather proposals from all nodes
+        proposals = self.gather_proposals(request_type, decision_data)
+        
+        # 2. Reach consensus
+        key_map = {node.node_id: node.key for node in self.nodes.values()}
+        consensus_result = self.consensus_decider.decide(proposals, key_map)
+        
+        logger.info(f"Consensus reached: {consensus_result['consensus_size']} nodes agreed")
+        
+        return consensus_result
+
+
+# ============================================================
+# PERCEIVE EXTENSION (DGK-AWARE VERDICT)
+# ============================================================
+
+class DGKAwareVerdict:
+    """
+    Extension to PolicyVerdict for multi-node consensus decisions.
+    """
+
+    def __init__(
+        self,
+        request_id: str,
+        approved: bool,
+        confidence: float,
+        consensus_result: Optional[Dict[str, Any]] = None,
+    ):
+        self.request_id = request_id
+        self.approved = approved
+        self.confidence = confidence
+        self.consensus_result = consensus_result
+        self.is_consensus_decision = consensus_result is not None
+        self.timestamp = datetime.now(timezone.utc).isoformat()
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize verdict."""
+        return {
+            "request_id": self.request_id,
+            "approved": self.approved,
+            "confidence": self.confidence,
+            "is_consensus": self.is_consensus_decision,
+            "consensus_result": self.consensus_result,
+            "timestamp": self.timestamp,
+        }
+
+
+# ============================================================
+# DEMO
+# ============================================================
+
+if __name__ == "__main__":
+    import secrets
+    
+    # Create 3 governance nodes
+    nodes = {
+        "hospital-1": GovernanceNode("hospital-1", secrets.token_bytes(32)),
+        "hospital-2": GovernanceNode("hospital-2", secrets.token_bytes(32)),
+        "hospital-3": GovernanceNode("hospital-3", secrets.token_bytes(32)),
+    }
+    
+    # Create consensus decider (2/3 quorum)
+    consensus = ConsensusDecider(quorum_fraction=2/3)
+    
+    # Create DGK gateway
+    gateway = DGKGateway(nodes, consensus)
+    
+    # Test 1: Consensus not required
+    print("Test 1: Regular escalation (no consensus required)")
+    print(f"Requires consensus: {gateway.require_consensus('escalate_patient', {})}")
+    
+    # Test 2: Consensus required for emergency override
+    print("\nTest 2: Emergency override (consensus required)")
+    print(f"Requires consensus: {gateway.require_consensus('emergency_override', {})}")
+    
+    # Test 3: Reach consensus
+    print("\nTest 3: Reaching consensus on emergency override")
+    decision_data = {
+        "emergency_reason": "Life-threatening deterioration",
+        "justification": "Patient O2 dropping rapidly",
+    }
+    
+    try:
+        result = gateway.reach_consensus("emergency_override", decision_data)
+        print(f"Consensus reached: {result['consensus_size']}/3 nodes agreed")
+        print(f"Leader node: {result['leader_node']}")
+        
+        verdict = DGKAwareVerdict(
+            request_id="REQ-OVERRIDE-001",
+            approved=True,
+            confidence=0.92,
+            consensus_result=result,
+        )
+        
+        print(f"Final verdict: {verdict.to_dict()}")
+    
+    except RuntimeError as e:
+        print(f"Consensus failed: {e}")

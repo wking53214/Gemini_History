@@ -1,0 +1,706 @@
+"""
+PERCEIVE + OBSERVE ORCHESTRATOR
+================================
+
+Production integration of:
+  - OBSERVE: Real-time Bayesian pediatric monitoring
+  - PERCEIVE: Governance kernel + clinical invariant validation + audit ledger
+
+Data flow:
+  Raw vitals → OBSERVE (Bayesian risk assessment)
+             → PERCEIVE (governance gates + invariant checks)
+             → Audit trail + state hash + outcome classification
+
+Deployment: FastAPI endpoint with JWT authentication
+"""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import hashlib
+import inspect
+import json
+import logging
+import os
+import secrets
+import time
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone, timedelta
+from enum import Enum
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import jwt
+import numpy as np
+from fastapi import FastAPI, Depends, HTTPException, Request, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, Field, field_validator
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logger = logging.getLogger("PERCEIVE_OBSERVE")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter(
+        "[PERCEIVE_OBSERVE] %(asctime)s %(levelname)s %(message)s"
+    ))
+    logger.addHandler(_h)
+
+# ============================================================
+# ENUMS & DECISION TYPES
+# ============================================================
+
+
+class DecisionStatus(Enum):
+    """Governance decision outcomes."""
+    ACCEPTED = "ACCEPTED"
+    GATE_REJECTED = "GATE_REJECTED"
+    INVARIANT_VIOLATED = "INVARIANT_VIOLATED"
+    FAULT_DETECTED = "FAULT_DETECTED"
+
+
+class RiskOutcome(Enum):
+    """Clinical risk classification."""
+    NORMAL = "normal"
+    EARLY_WARNING = "early_warning"
+    DETERIORATION = "deterioration"
+    CRITICAL = "critical"
+
+# ============================================================
+# TIME & CRYPTO UTILITIES
+# ============================================================
+
+
+def now_ts() -> float:
+    return time.time()
+
+
+def iso_ts() -> str:
+    return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+
+
+def site_scoped_hmac(site_salt: bytes, patient_id: str) -> str:
+    import hmac
+    return hmac.new(
+        site_salt,
+        patient_id.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+# ============================================================
+# PERCEIVE: GOVERNANCE KERNEL
+# ============================================================
+
+
+@dataclass
+class Event:
+    """Clinical event (admission, observation, intervention)."""
+    event_type: str
+    delta: Dict[str, Any]
+    context_id: str
+    timestamp: str = field(default_factory=iso_ts)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class State:
+    """Immutable state snapshot."""
+    history: List[Event] = field(default_factory=list)
+    context: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "history": [asdict(e) for e in self.history],
+            "context": self.context
+        }
+
+
+@dataclass
+class Manifest:
+    """Versioned governance policy with cryptographic integrity."""
+    manifest_id: str
+    version: str
+    invariants: List[Callable[[State, Optional[Event]], bool]]
+    invariant_names: List[str]
+    author: str = ""
+    approval_authority: str = ""
+    effective_date: str = ""
+    risk_level: str = ""
+    hash: str = ""
+    change_log: List[str] = field(default_factory=list)
+
+    def compute_hash(self) -> str:
+        """Deterministic hash over manifest structure + invariant bytecode."""
+        code_hashes = []
+        for inv in self.invariants:
+            try:
+                bytecode = inspect.getsource(inv).encode()
+                code_hashes.append(hashlib.sha256(bytecode).hexdigest())
+            except Exception:
+                code_hashes.append("SOURCE_UNAVAILABLE")
+
+        schema = json.dumps({
+            "manifest_id": self.manifest_id,
+            "version": self.version,
+            "invariant_names": self.invariant_names,
+            "author": self.author,
+            "approval_authority": self.approval_authority,
+            "effective_date": self.effective_date,
+            "risk_level": self.risk_level,
+            "bytecode_signatures": code_hashes
+        }, sort_keys=True)
+        return hashlib.sha256(schema.encode()).hexdigest()
+
+
+@dataclass
+class AuditEntry:
+    """Single immutable audit log entry with cryptographic chaining."""
+    timestamp: str
+    event: Optional[Event]
+    manifest_version: str
+    decision: DecisionStatus
+    reason: str
+    gate_results: Dict[str, Tuple[bool, Optional[str]]]
+    invariant_results: Dict[str, Tuple[bool, Optional[str]]]
+    sequence_number: int
+    audit_hash: Optional[str] = None
+
+
+class GovernanceKernel:
+    """
+    Enforcement layer: gates + invariants + audit ledger.
+    
+    Every clinical decision passes through:
+      1. Gates (permission check)
+      2. Pre-transition invariants (before state valid?)
+      3. State transition
+      4. Post-transition invariants (after state valid?)
+      5. Audit logging (immutable chain)
+    """
+
+    def __init__(self):
+        self.audit_log: List[AuditEntry] = []
+        self.state_store: Dict[str, State] = {}
+        self.sequence_counter = 0
+        self.audit_chain_tip: Optional[str] = None
+
+    def safe_invariant_check(
+        self,
+        invariant: Callable,
+        name: str,
+        state: State,
+        event: Optional[Event]
+    ) -> Tuple[bool, Optional[str]]:
+        """Safe evaluation of invariant with exception handling."""
+        try:
+            result = invariant(state, event)
+            if not isinstance(result, bool):
+                return False, f"Non-bool return from {name}"
+            return result, None
+        except Exception as ex:
+            return False, f"Exception in {name}: {str(ex)}"
+
+    def safe_gate_check(
+        self,
+        gate: Callable,
+        name: str,
+        event: Event,
+        state: State,
+        manifest: Manifest
+    ) -> Tuple[bool, Optional[str]]:
+        """Safe evaluation of gate with exception handling."""
+        try:
+            result = gate(event, state, manifest)
+            if not isinstance(result, bool):
+                return False, f"Non-bool return from {name}"
+            return result, None
+        except Exception as ex:
+            return False, f"Exception in {name}: {str(ex)}"
+
+    def valid(
+        self,
+        state: State,
+        manifest: Manifest,
+        event: Optional[Event] = None
+    ) -> Tuple[bool, Dict[str, Tuple[bool, Optional[str]]]]:
+        """Check all invariants."""
+        results = {}
+        for inv, name in zip(manifest.invariants, manifest.invariant_names):
+            ok, fault = self.safe_invariant_check(inv, name, state, event)
+            results[name] = (ok, fault)
+            if not ok:
+                return False, results
+        return True, results
+
+    def allowed(
+        self,
+        event: Event,
+        state: State,
+        manifest: Manifest,
+        gates: List[Tuple[Callable, str]]
+    ) -> Tuple[bool, Dict[str, Tuple[bool, Optional[str]]]]:
+        """Check all gates."""
+        results = {}
+        for gate, name in gates:
+            ok, fault = self.safe_gate_check(gate, name, event, state, manifest)
+            results[name] = (ok, fault)
+            if not ok:
+                return False, results
+        return True, results
+
+    def transition(
+        self,
+        state: State,
+        event: Event,
+        manifest: Manifest,
+        gates: List[Tuple[Callable, str]]
+    ) -> Tuple[State, DecisionStatus, str, Dict, Dict]:
+        """Execute gated state transition with invariant checking."""
+        gate_results = {}
+        invariant_results = {}
+
+        # Step 1: Check gates
+        gates_ok, gate_results = self.allowed(event, state, manifest, gates)
+        if not gates_ok:
+            has_fault = any(fault for _, fault in gate_results.values() if fault)
+            status = (
+                DecisionStatus.FAULT_DETECTED
+                if has_fault
+                else DecisionStatus.GATE_REJECTED
+            )
+            return state, status, "Gate rejection", gate_results, {}
+
+        # Step 2: Check pre-transition invariants
+        before_ok, before_invs = self.valid(state, manifest, event)
+        invariant_results.update(before_invs)
+        if not before_ok:
+            return (
+                state,
+                DecisionStatus.INVARIANT_VIOLATED,
+                "Pre-transition invariant violation",
+                gate_results,
+                invariant_results,
+            )
+
+        # Step 3: Transition
+        new_state = copy.deepcopy(state)
+        new_state.history.append(event)
+        new_state.context.update(event.delta)
+
+        # Step 4: Check post-transition invariants
+        after_ok, after_invs = self.valid(new_state, manifest, None)
+        invariant_results.update(after_invs)
+        if not after_ok:
+            return (
+                state,
+                DecisionStatus.INVARIANT_VIOLATED,
+                "Post-transition invariant violation",
+                gate_results,
+                invariant_results,
+            )
+
+        return new_state, DecisionStatus.ACCEPTED, "OK", gate_results, invariant_results
+
+    def dial(self, state: State) -> str:
+        """Deterministic state hash (identity projection)."""
+        encoded = json.dumps(state.to_dict(), sort_keys=True)
+        return hashlib.sha256(encoded.encode()).hexdigest()
+
+    def compute_audit_hash(
+        self,
+        previous_hash: Optional[str],
+        entry: AuditEntry
+    ) -> str:
+        """Hash chain: previous + current = next."""
+        payload = {
+            "previous_hash": previous_hash,
+            "timestamp": entry.timestamp,
+            "event": asdict(entry.event) if entry.event else None,
+            "decision": entry.decision.value,
+            "manifest_version": entry.manifest_version,
+            "sequence_number": entry.sequence_number,
+        }
+        encoded = json.dumps(payload, sort_keys=True)
+        return hashlib.sha256(encoded.encode()).hexdigest()
+
+    def run_event(
+        self,
+        state: State,
+        event: Event,
+        manifest: Manifest,
+        gates: List[Tuple[Callable, str]]
+    ) -> Tuple[State, Optional[str], AuditEntry]:
+        """Execute event through governance kernel."""
+        self.sequence_counter += 1
+
+        new_state, decision, reason, gate_results, inv_results = self.transition(
+            state, event, manifest, gates
+        )
+
+        if decision == DecisionStatus.ACCEPTED:
+            state_hash = self.dial(new_state)
+            self.state_store[state_hash] = new_state
+        else:
+            state_hash = None
+
+        audit_entry = AuditEntry(
+            timestamp=iso_ts(),
+            event=event,
+            manifest_version=manifest.version,
+            decision=decision,
+            reason=reason,
+            gate_results=gate_results,
+            invariant_results=inv_results,
+            sequence_number=self.sequence_counter,
+        )
+
+        audit_entry.audit_hash = self.compute_audit_hash(
+            self.audit_chain_tip,
+            audit_entry
+        )
+        self.audit_chain_tip = audit_entry.audit_hash
+        self.audit_log.append(audit_entry)
+
+        return new_state, state_hash, audit_entry
+
+    def verify_audit_chain(self) -> bool:
+        """Verify entire audit chain integrity."""
+        tip = None
+        for entry in self.audit_log:
+            expected = self.compute_audit_hash(tip, entry)
+            if expected != entry.audit_hash:
+                return False
+            tip = entry.audit_hash
+        return tip == self.audit_chain_tip
+
+# ============================================================
+# PEDIATRIC INVARIANTS
+# ============================================================
+
+
+def create_pediatric_manifest() -> Manifest:
+    """Governance manifest for pediatric vitals."""
+
+    def invariant_hr_range(state: State, event: Optional[Event]) -> bool:
+        if not state.context:
+            return True
+        hr = state.context.get("vitals", {}).get("heart_rate", 0)
+        return 60 <= hr <= 220
+
+    def invariant_rr_range(state: State, event: Optional[Event]) -> bool:
+        if not state.context:
+            return True
+        rr = state.context.get("vitals", {}).get("respiratory_rate", 0)
+        return 12 <= rr <= 100
+
+    def invariant_o2_minimum(state: State, event: Optional[Event]) -> bool:
+        if not state.context:
+            return True
+        o2 = state.context.get("vitals", {}).get("spo2", 100)
+        return o2 >= 75
+
+    def invariant_temp_range(state: State, event: Optional[Event]) -> bool:
+        if not state.context:
+            return True
+        temp = state.context.get("vitals", {}).get("temp_c", 37.0)
+        return 34.0 <= temp <= 41.0
+
+    manifest = Manifest(
+        manifest_id="PEDIATRIC-INVARIANTS-V1",
+        version="v1.0",
+        invariants=[
+            invariant_hr_range,
+            invariant_rr_range,
+            invariant_o2_minimum,
+            invariant_temp_range,
+        ],
+        invariant_names=[
+            "heart_rate_range",
+            "respiratory_rate_range",
+            "oxygen_saturation_floor",
+            "temperature_range",
+        ],
+        author="PERCEIVE-System",
+        approval_authority="Clinical-Governance",
+        effective_date=datetime.now().date().isoformat(),
+        risk_level="HIGH"
+    )
+    manifest.hash = manifest.compute_hash()
+    return manifest
+
+
+def create_pediatric_gates() -> List[Tuple[Callable, str]]:
+    """Permission gates for pediatric decisions."""
+
+    def gate_event_not_null(event: Event, state: State, manifest: Manifest) -> bool:
+        return bool(event.event_type and event.context_id)
+
+    def gate_no_duplicate_timestamps(event: Event, state: State, manifest: Manifest) -> bool:
+        if not state.history:
+            return True
+        last_ts = state.history[-1].timestamp
+        return event.timestamp >= last_ts
+
+    def gate_vitals_plausible(event: Event, state: State, manifest: Manifest) -> bool:
+        if "vitals" not in event.delta:
+            return True
+        last_vitals = state.context.get("vitals", {})
+        new_vitals = event.delta.get("vitals", {})
+        if not last_vitals:
+            return True
+        for key in ["heart_rate", "respiratory_rate", "spo2", "temp_c"]:
+            if key in last_vitals and key in new_vitals:
+                old_val = last_vitals[key]
+                new_val = new_vitals[key]
+                if old_val > 0:
+                    pct_change = abs(new_val - old_val) / old_val
+                    if pct_change > 0.75:
+                        return False
+        return True
+
+    return [
+        (gate_event_not_null, "event_not_null"),
+        (gate_no_duplicate_timestamps, "no_duplicate_timestamps"),
+        (gate_vitals_plausible, "vitals_plausible"),
+    ]
+
+# ============================================================
+# CLINICAL RISK CLASSIFICATION
+# ============================================================
+
+
+@dataclass
+class RiskComponents:
+    """Z-score components + Lyapunov energy."""
+    hr_z: float
+    rr_z: float
+    o2_z: float
+    temp_z: float
+    lyapunov_energy: float
+    outcome: RiskOutcome
+
+
+def compute_z(value: float, mean: float, std: float) -> float:
+    """Z-score: (value - mean) / std."""
+    if std <= 0:
+        return 0.0
+    return (value - mean) / std
+
+
+def compute_lyapunov_energy(comps: RiskComponents) -> float:
+    """Sum of squared Z-scores (stability measure)."""
+    return comps.hr_z ** 2 + comps.rr_z ** 2 + comps.o2_z ** 2 + comps.temp_z ** 2
+
+
+def classify_outcome(energy: float) -> RiskOutcome:
+    """Map Lyapunov energy to clinical outcome."""
+    if energy < 4.0:
+        return RiskOutcome.NORMAL
+    elif energy < 9.0:
+        return RiskOutcome.EARLY_WARNING
+    elif energy < 16.0:
+        return RiskOutcome.DETERIORATION
+    else:
+        return RiskOutcome.CRITICAL
+
+
+def evaluate_clinical_risk(vitals: Dict[str, float]) -> RiskComponents:
+    """Compute risk components from vitals."""
+    hr = vitals.get("heart_rate", 0.0)
+    rr = vitals.get("respiratory_rate", 0.0)
+    o2 = vitals.get("spo2", 100.0)
+    temp = vitals.get("temp_c", 37.0)
+
+    # Age-adjusted norms (simplified)
+    hr_z = compute_z(hr, 130.0, 20.0)
+    rr_z = compute_z(rr, 40.0, 10.0)
+    o2_z = compute_z(o2, 97.0, 3.0)
+    temp_z = compute_z(temp, 37.0, 0.5)
+
+    comps = RiskComponents(
+        hr_z=hr_z,
+        rr_z=rr_z,
+        o2_z=o2_z,
+        temp_z=temp_z,
+        lyapunov_energy=0.0,
+        outcome=RiskOutcome.NORMAL,
+    )
+    comps.lyapunov_energy = compute_lyapunov_energy(comps)
+    comps.outcome = classify_outcome(comps.lyapunov_energy)
+    return comps
+
+# ============================================================
+# FASTAPI APPLICATION
+# ============================================================
+
+app = FastAPI(
+    title="PERCEIVE + OBSERVE",
+    description="Governance-wrapped Bayesian pediatric monitoring",
+    version="1.0.0",
+)
+
+security = HTTPBearer()
+
+JWT_SECRET_KEY = os.getenv(
+    "OBSERVE_JWT_SECRET",
+    "OBSERVE_STRICT_GOVERNANCE_SECRET_KEY"
+)
+JWT_ALGORITHM = "HS256"
+SITE_SALT = os.getenv(
+    "OBSERVE_SITE_SALT",
+    "OBSERVE_SITE_SALT"
+).encode("utf-8")
+
+
+# Pydantic schemas
+class VitalsPayload(BaseModel):
+    heart_rate: float = Field(ge=0.0, le=300.0)
+    respiratory_rate: float = Field(ge=0.0, le=120.0)
+    spo2: float = Field(ge=0.0, le=100.0)
+    temp_c: float = Field(ge=30.0, le=42.0)
+
+
+class ContextPayload(BaseModel):
+    patient_id: str
+    age_months: int = Field(ge=0, le=240)
+
+
+class ObservationRequest(BaseModel):
+    vitals: VitalsPayload
+    context: ContextPayload
+
+
+class ObservationResponse(BaseModel):
+    patient_pseudonym: str
+    risk_score: float
+    outcome: str
+    components: Dict[str, float]
+    decision: str
+    audit_chain_valid: bool
+    manifest_version: str
+    timestamp: str
+
+
+# Singletons
+kernel = GovernanceKernel()
+manifest = create_pediatric_manifest()
+gates = create_pediatric_gates()
+patient_states: Dict[str, State] = {}
+
+
+def verify_tenant_token(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> str:
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        tenant_id: str = payload.get("tenant_id")
+        if tenant_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token: missing tenant_id.",
+            )
+        return tenant_id
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token expired.",
+        )
+    except jwt.PyJWTError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Token invalid or tampered.",
+        )
+
+
+@app.post("/api/v1/observation", response_model=ObservationResponse)
+async def record_observation(
+    request: Request,
+    payload: ObservationRequest,
+    tenant_id: str = Depends(verify_tenant_token),
+) -> ObservationResponse:
+    """
+    Record pediatric observation through governance envelope.
+    
+    Flow:
+      1. Pseudonymize patient
+      2. Create observation event
+      3. Run through PERCEIVE gates + invariants
+      4. Compute clinical risk (OBSERVE)
+      5. Return audit-verified response
+    """
+    # Pseudonymize
+    pseudonym = site_scoped_hmac(SITE_SALT, payload.context.patient_id)
+
+    # Get or create patient state
+    if pseudonym not in patient_states:
+        patient_states[pseudonym] = State()
+    state = patient_states[pseudonym]
+
+    # Create event
+    event = Event(
+        event_type="observation",
+        delta={
+            "vitals": asdict(payload.vitals),
+            "age_months": payload.context.age_months,
+        },
+        context_id=pseudonym,
+    )
+
+    # Run through governance kernel
+    new_state, state_hash, audit_entry = kernel.run_event(
+        state,
+        event,
+        manifest,
+        gates
+    )
+
+    # Update state only if accepted
+    if audit_entry.decision == DecisionStatus.ACCEPTED:
+        patient_states[pseudonym] = new_state
+
+    # Compute clinical risk
+    vitals = new_state.context.get("vitals", {})
+    risk_comps = evaluate_clinical_risk(vitals)
+
+    components = {
+        "hr_z": risk_comps.hr_z,
+        "rr_z": risk_comps.rr_z,
+        "o2_z": risk_comps.o2_z,
+        "temp_z": risk_comps.temp_z,
+        "lyapunov_energy": risk_comps.lyapunov_energy,
+    }
+
+    return ObservationResponse(
+        patient_pseudonym=pseudonym,
+        risk_score=risk_comps.lyapunov_energy,
+        outcome=risk_comps.outcome.value,
+        components=components,
+        decision=audit_entry.decision.value,
+        audit_chain_valid=kernel.verify_audit_chain(),
+        manifest_version=manifest.version,
+        timestamp=iso_ts(),
+    )
+
+
+@app.get("/health", status_code=status.HTTP_200_OK)
+async def system_health() -> Dict[str, Any]:
+    """System health + audit integrity."""
+    return {
+        "status": "operational",
+        "timestamp": iso_ts(),
+        "audit_chain_valid": kernel.verify_audit_chain(),
+        "audit_entries": len(kernel.audit_log),
+        "active_patients": len(patient_states),
+        "manifest_hash": manifest.hash,
+    }
+
+
+# Local demo
+if __name__ == "__main__":
+    import uvicorn
+    logger.info("Starting PERCEIVE + OBSERVE on http://0.0.0.0:8080")
+    uvicorn.run(app, host="0.0.0.0", port=8080)

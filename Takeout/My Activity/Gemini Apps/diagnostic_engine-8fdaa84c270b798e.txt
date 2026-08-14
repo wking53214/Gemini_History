@@ -1,0 +1,359 @@
+"""
+diagnostic_engine.py — Find where containment leaks, by segment, from the data.
+
+This is the thing you run on day one of an engagement. It takes journeys (from the
+harness now, real client logs later) plus the observed caller attributes, and
+discovers which KINDS of callers are bailing and where containment is fake.
+
+It does NOT prescribe a fix. It finds and describes the leak. Telling you what to
+DO about it is the simulator + prescription layer (later). Keeping "I found a
+problem" separate from "here is the fix" is a deliberate honesty boundary.
+
+THE TWO-TIER HYBRID
+-------------------
+  TIER 1 — the transparent SCAN -> Findings (trusted, shippable).
+    Containment by each single observed attribute, and by pairs. Every result is
+    human-legible ("phone + fraud callers contain at 22%") and directly checkable.
+    A ghost is unlikely at this granularity and easy to spot. These are findings
+    you can stand behind today.
+
+  TIER 2 — the TREE discovery -> Candidates (leads, UNVALIDATED).
+    A simple, transparent recursive split that finds the deeper attribute
+    INTERACTIONS the scan misses (the non-obvious three-way segment). Because
+    deep interaction-mining is exactly where ghosts breed, NOTHING the tree
+    surfaces is a finding — it is a lead, carrying the metadata the future Partner
+    (validation + fairness) engine needs, with empty verdict slots.
+
+WHY KEEP THEM SEPARATE (not one blended list)
+---------------------------------------------
+Blending would mix the tree's ghosts with the scan's solid ground and lose the
+ability to tell them apart — worse than either method alone. Separation by TYPE
+(Finding vs Candidate) makes the trust level un-confusable. The scan and tree also
+CROSS-CHECK each other: a tree candidate whose driving attribute also shows up in
+the scan is more plausible; one the scan sees no trace of is flagged as ghost-risk.
+
+THE FAIRNESS BOUNDARY
+---------------------
+Discovery may surface ANY pattern. The discipline lives at the output: any leak or
+candidate whose definition includes a protected attribute (or that an audit shows
+tracks one) is FLAGGED, never presented as an optimization target. The fairness
+verdict slot stays for the Partner's full disparate-impact audit; this engine does
+the first-pass flagging so a protected-linked pattern can never silently become a
+recommendation.
+
+EVERYTHING HERE IS A CANDIDATE FOR THE PARTNER, NOT A VALIDATED TRUTH
+--------------------------------------------------------------------
+Even Tier 1 findings carry verdict slots. This engine generates; the Partner
+validates and audits. The seam is real so the Partner plugs in cleanly later.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import defaultdict
+from typing import Dict, List, Optional, Sequence, Tuple
+
+from ivr_tree import Outcome
+from traversal import Journey
+from diagnostic_types import (
+    SegmentSpec, ContainmentStats, Finding, Candidate, DiagnosticReport, Verdict,
+)
+
+
+# Attributes that are protected or protected-style. A segment constrained on any
+# of these is flagged, not offered as an optimization target. (age_band is the
+# protected-style attribute the harness uses; protected_group is the explicit marker.)
+PROTECTED_KEYS = ("protected_group", "age_band")
+
+# Observed attributes the engine is allowed to segment on for OPTIMIZATION.
+# Deliberately excludes the protected keys above and the join id.
+BEHAVIORAL_KEYS = ("reason", "channel", "product", "language", "region")
+
+
+def _stats_for(journeys: Sequence[Journey]) -> ContainmentStats:
+    n = len(journeys)
+    contained = sum(1 for j in journeys if j.contained)
+    resolved = sum(1 for j in journeys if j.truly_resolved)
+    fake = sum(1 for j in journeys if j.outcome is Outcome.CONTAINED_UNRESOLVED)
+    agent = sum(1 for j in journeys if j.outcome is Outcome.AGENT)
+    poundout = sum(1 for j in journeys if j.outcome is Outcome.POUNDOUT)
+    hangup = sum(1 for j in journeys if j.outcome is Outcome.HANGUP)
+    return ContainmentStats(n=n, contained=contained, resolved=resolved,
+                            fake_contained=fake, reached_agent=agent,
+                            poundout=poundout, hangup=hangup)
+
+
+class DiagnosticEngine:
+    def __init__(self,
+                 min_segment_support: int = 150,
+                 finding_gap_threshold: float = 0.05,
+                 tree_max_depth: int = 3,
+                 tree_min_leaf: int = 100):
+        """
+        min_segment_support : a segment smaller than this is too small to trust
+                              (ghost risk); scan segments below it are skipped.
+        finding_gap_threshold : a scan segment must be at least this much worse
+                              than overall containment to be reported as a leak.
+        tree_max_depth      : how deep the interaction tree may go.
+        tree_min_leaf       : a tree leaf below this support is not surfaced.
+        All are ILLUSTRATIVE defaults, not calibrated against real data.
+        """
+        self.min_support = min_segment_support
+        self.finding_gap = finding_gap_threshold
+        self.tree_max_depth = tree_max_depth
+        self.tree_min_leaf = tree_min_leaf
+
+    # ── public entry point ────────────────────────────────────────────────────
+
+    def diagnose(self, journeys: Sequence[Journey],
+                 observed_by_id: Dict[str, Dict[str, object]]) -> DiagnosticReport:
+        """journeys + a map from caller_id -> observed attributes. Produces the
+        two-tier report."""
+        assumptions = [
+            "Containment counts real + fake; the decomposition separates them.",
+            "Tier 1 findings are transparent and shippable; Tier 2 candidates are "
+            "UNVALIDATED leads for the Partner system.",
+            "Thresholds are illustrative, not calibrated on real data.",
+            "Segmentation for optimization uses behavioral/contextual attributes "
+            "only; protected attributes are flagged, never optimized on.",
+        ]
+        overall = _stats_for(journeys)
+        report = DiagnosticReport(overall=overall, assumptions=assumptions)
+
+        # pair each journey with its observed attributes (skip any missing — honestly)
+        paired: List[Tuple[Journey, Dict[str, object]]] = []
+        missing = 0
+        for j in journeys:
+            obs = observed_by_id.get(j.caller_id)
+            if obs is None:
+                missing += 1
+                continue
+            paired.append((j, obs))
+        if missing:
+            report.fairness_flags.append(
+                f"note: {missing} journeys had no observed attributes and were excluded")
+
+        # TIER 1: transparent scan
+        report.findings = self._scan(paired, overall)
+        # TIER 2: tree discovery
+        report.candidates = self._tree_discovery(paired, overall, report.findings)
+        # fairness pass across both tiers (+ disparate-impact scan needs paired)
+        self._fairness_pass(report, paired)
+        return report
+
+    # ── TIER 1: the transparent scan ──────────────────────────────────────────
+
+    def _scan(self, paired: List[Tuple[Journey, Dict[str, object]]],
+              overall: ContainmentStats) -> List[Finding]:
+        findings: List[Finding] = []
+
+        # single-attribute leaks (behavioral keys only for optimization; protected
+        # keys are scanned too but only to FLAG, handled in the fairness pass)
+        for key in BEHAVIORAL_KEYS:
+            groups: Dict[object, List[Journey]] = defaultdict(list)
+            for j, obs in paired:
+                if key in obs:
+                    groups[obs[key]].append(j)
+            for val, js in groups.items():
+                if len(js) < self.min_support:
+                    continue
+                f = self._maybe_finding({key: val}, js, overall, method="scan:single")
+                if f:
+                    findings.append(f)
+
+        # pairwise leaks (interactions of two behavioral attributes)
+        for i, k1 in enumerate(BEHAVIORAL_KEYS):
+            for k2 in BEHAVIORAL_KEYS[i + 1:]:
+                groups2: Dict[Tuple[object, object], List[Journey]] = defaultdict(list)
+                for j, obs in paired:
+                    if k1 in obs and k2 in obs:
+                        groups2[(obs[k1], obs[k2])].append(j)
+                for (v1, v2), js in groups2.items():
+                    if len(js) < self.min_support:
+                        continue
+                    f = self._maybe_finding({k1: v1, k2: v2}, js, overall, method="scan:pairwise")
+                    if f:
+                        findings.append(f)
+
+        # rank by how bad the leak is (worst containment gap first, then fake gap)
+        findings.sort(key=lambda f: (f.containment_gap_vs_overall, -f.fake_gap_vs_overall))
+        return findings
+
+    def _maybe_finding(self, constraints: Dict[str, object], js: List[Journey],
+                       overall: ContainmentStats, method: str) -> Optional[Finding]:
+        s = _stats_for(js)
+        cont_gap = s.containment_rate - overall.containment_rate
+        fake_gap = s.fake_containment_rate - overall.fake_containment_rate
+        # report a leak if containment is materially worse OR fake containment is
+        # materially higher than the overall population
+        is_containment_leak = cont_gap <= -self.finding_gap
+        is_fake_leak = fake_gap >= self.finding_gap
+        if not (is_containment_leak or is_fake_leak):
+            return None
+        bits = []
+        if is_containment_leak:
+            bits.append(f"containment {s.containment_rate:.1%} "
+                        f"({cont_gap*100:+.1f}pt vs overall)")
+        if is_fake_leak:
+            bits.append(f"fake containment {s.fake_containment_rate:.1%} "
+                        f"({fake_gap*100:+.1f}pt vs overall; "
+                        f"{s.fake_share_of_contained:.0%} of contained is fake)")
+        return Finding(
+            segment=SegmentSpec(constraints), stats=s,
+            containment_gap_vs_overall=round(cont_gap, 4),
+            fake_gap_vs_overall=round(fake_gap, 4),
+            method=method,
+            rationale="; ".join(bits),
+        )
+
+    # ── TIER 2: the tree discovery ────────────────────────────────────────────
+
+    def _tree_discovery(self, paired: List[Tuple[Journey, Dict[str, object]]],
+                        overall: ContainmentStats,
+                        findings: List[Finding]) -> List[Candidate]:
+        """A simple, transparent recursive split on 'did the caller contain'. Finds
+        the attribute combination that best separates contained from not, going
+        deeper than the pairwise scan. Surfaces leaf segments as CANDIDATES.
+
+        Kept legible on purpose (no black-box model): each candidate is a path of
+        attribute=value splits a human can read."""
+        candidates: List[Candidate] = []
+
+        def contained_rate(items: List[Tuple[Journey, Dict[str, object]]]) -> float:
+            if not items:
+                return 0.0
+            return sum(1 for j, _ in items if j.contained) / len(items)
+
+        # scan attributes the scan used for the cross-check
+        scan_keys = set()
+        for f in findings:
+            scan_keys.update(f.segment.constraints.keys())
+
+        def recurse(items, used_keys, constraints, depth):
+            if depth >= self.tree_max_depth or len(items) < self.tree_min_leaf:
+                return
+            base_rate = contained_rate(items)
+            best = None  # (key, gain, split_groups)
+            for key in BEHAVIORAL_KEYS:
+                if key in used_keys:
+                    continue
+                groups: Dict[object, List] = defaultdict(list)
+                for j, obs in items:
+                    if key in obs:
+                        groups[obs[key]].append((j, obs))
+                if len(groups) < 2:
+                    continue
+                # gain = how much the worst child deviates from this node's rate,
+                # weighted by support (favor splits that isolate a real leak)
+                worst_dev = 0.0
+                for val, sub in groups.items():
+                    if len(sub) < self.tree_min_leaf:
+                        continue
+                    dev = abs(contained_rate(sub) - base_rate)
+                    if dev > worst_dev:
+                        worst_dev = dev
+                if best is None or worst_dev > best[1]:
+                    best = (key, worst_dev, groups)
+            if best is None or best[1] < 0.03:   # no split meaningfully separates
+                return
+            key, _, groups = best
+            for val, sub in groups.items():
+                if len(sub) < self.tree_min_leaf:
+                    continue
+                child_constraints = dict(constraints, **{key: val})
+                child_depth = depth + 1
+                # surface as a candidate if this leaf is a notable leak AND it is
+                # deeper than pairwise (depth >= 3) — i.e. an interaction the scan
+                # could not have found
+                s = _stats_for([j for j, _ in sub])
+                cont_gap = s.containment_rate - overall.containment_rate
+                if child_depth >= 3 and cont_gap <= -self.finding_gap:
+                    # cross-check: did the scan flag any attribute in this segment?
+                    corroborated = bool(set(child_constraints.keys()) & scan_keys)
+                    cand = Candidate(
+                        segment=SegmentSpec(child_constraints), stats=s,
+                        containment_gap_vs_overall=round(cont_gap, 4),
+                        fake_gap_vs_overall=round(
+                            s.fake_containment_rate - overall.fake_containment_rate, 4),
+                        depth=child_depth, support=s.n, method="tree",
+                        corroborated_by_scan=corroborated,
+                        rationale=(f"interaction leak: containment {s.containment_rate:.1%} "
+                                   f"({cont_gap*100:+.1f}pt vs overall) at depth {child_depth}"),
+                    )
+                    if not corroborated:
+                        cand.notes.append("NOT corroborated by the transparent scan — "
+                                          "higher ghost risk; needs validation")
+                    candidates.append(cand)
+                recurse(sub, used_keys | {key}, child_constraints, child_depth)
+
+        recurse(paired, set(), {}, 0)
+        # de-duplicate by segment description, keep worst-gap version
+        by_desc: Dict[str, Candidate] = {}
+        for c in candidates:
+            d = c.segment.describe()
+            if d not in by_desc or c.containment_gap_vs_overall < by_desc[d].containment_gap_vs_overall:
+                by_desc[d] = c
+        out = sorted(by_desc.values(), key=lambda c: c.containment_gap_vs_overall)
+        return out
+
+    # ── fairness pass across both tiers ───────────────────────────────────────
+
+    def _fairness_pass(self, report: DiagnosticReport,
+                       paired: Optional[List[Tuple[Journey, Dict[str, object]]]] = None) -> None:
+        """Two-part fairness handling:
+
+        (1) FLAG any finding/candidate whose segment is DEFINED on a protected
+            attribute — it must never be an optimization target.
+        (2) DISPARATE-IMPACT SCAN: separately measure containment AND live-agent
+            access across each protected attribute's groups, and flag any material
+            gap. This is the crucial part: the engine excludes protected attributes
+            from OPTIMIZATION, but it must still LOOK at them to detect inequity the
+            system might otherwise be blind to. Detecting disparity is the opposite
+            of creating it. The Partner does the full audit; this is the first pass
+            so a real disparity cannot pass unnoticed.
+        """
+        def touches_protected(spec: SegmentSpec) -> bool:
+            return any(k in spec.constraints for k in PROTECTED_KEYS)
+
+        # (1) flag protected-defined segments
+        for f in report.findings:
+            if touches_protected(f.segment):
+                f.fairness_verdict = Verdict.FLAGGED
+                f.notes.append("segment defined on a protected attribute — flagged, "
+                               "not an optimization target")
+                report.fairness_flags.append(
+                    f"FINDING flagged (protected attribute): {f.segment.describe()}")
+        for c in report.candidates:
+            if touches_protected(c.segment):
+                c.fairness_verdict = Verdict.FLAGGED
+                c.notes.append("segment defined on a protected attribute — flagged, "
+                               "not an optimization target")
+                report.fairness_flags.append(
+                    f"CANDIDATE flagged (protected attribute): {c.segment.describe()}")
+
+        # (2) disparate-impact scan across protected attributes
+        if paired is not None:
+            overall = report.overall
+            for key in PROTECTED_KEYS:
+                groups: Dict[object, List[Journey]] = defaultdict(list)
+                for j, obs in paired:
+                    if key in obs:
+                        groups[obs[key]].append(j)
+                for val, js in groups.items():
+                    if len(js) < self.min_support:
+                        continue
+                    s = _stats_for(js)
+                    cont_gap = s.containment_rate - overall.containment_rate
+                    # agent-access gap: do members of this group reach a human LESS?
+                    # (lower agent access for a protected group can itself be the harm)
+                    grp_agent = s.reached_agent / s.n if s.n else 0.0
+                    overall_agent = overall.reached_agent / overall.n if overall.n else 0.0
+                    agent_gap = grp_agent - overall_agent
+                    # flag a MATERIAL adverse gap (worse containment experience OR
+                    # materially different agent access) for this protected group
+                    if cont_gap <= -self.finding_gap or abs(agent_gap) >= self.finding_gap:
+                        report.fairness_flags.append(
+                            f"DISPARATE IMPACT: {key}={val} (n={s.n}) — "
+                            f"containment {s.containment_rate:.1%} ({cont_gap*100:+.1f}pt vs overall), "
+                            f"agent access {grp_agent:.1%} ({agent_gap*100:+.1f}pt). "
+                            f"NOT an optimization target; route to Partner audit.")

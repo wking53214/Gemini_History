@@ -1,0 +1,76 @@
+"""
+run_diagnostic.py — Demonstrate the diagnostic engine end-to-end.
+
+Builds a population, runs it through the reference IVR, and produces the full
+two-tier diagnostic report the way a real engagement would see it. Run with an
+optional flag to plant a protected disparity and watch the fairness scan catch it.
+
+    python3 run_diagnostic.py            # clean population
+    python3 run_diagnostic.py --bias     # planted protected disparity
+"""
+
+from __future__ import annotations
+
+import sys
+
+from reference_tree import build_reference_tree, run_harness
+from caller_model import PopulationGenerator, PopulationConfig
+from diagnostic_engine import DiagnosticEngine
+
+
+def main(plant_bias: bool = False):
+    cfg = PopulationConfig(n=12000, seed=11,
+                           plant_protected_bias=plant_bias,
+                           protected_bias_strength=0.35)
+    pop = PopulationGenerator(cfg).generate()
+    tree = build_reference_tree()
+    journeys = run_harness(pop, tree, seed=11)
+    observed = {c.caller_id: c.observed() for c in pop}
+
+    report = DiagnosticEngine().diagnose(journeys, observed)
+
+    print("=" * 74)
+    print(report.summary())
+    print("=" * 74)
+
+    print("\nTIER 1 — FINDINGS (transparent scan; shippable, you can stand behind these)")
+    print("-" * 74)
+    for f in report.findings[:10]:
+        print(f"  • {f.segment.describe()}")
+        print(f"      {f.rationale}")
+    if len(report.findings) > 10:
+        print(f"  ... and {len(report.findings) - 10} more")
+
+    print("\nTIER 2 — CANDIDATES (tree leads; UNVALIDATED, for the Partner to interrogate)")
+    print("-" * 74)
+    if not report.candidates:
+        print("  (none surfaced at current thresholds — honest: the planted effects")
+        print("   are single-attribute, so deep interactions beyond pairwise are rare)")
+    for c in report.candidates[:8]:
+        tag = "corroborated by scan" if c.corroborated_by_scan else "NOT corroborated — ghost risk"
+        print(f"  • {c.segment.describe()}  [{tag}]")
+        print(f"      {c.rationale}")
+        print(f"      validation={c.validation_verdict.value}, fairness={c.fairness_verdict.value}, "
+              f"client_ready={c.client_ready}")
+
+    print("\nFAIRNESS — disparate-impact scan (protected attributes: detect, never optimize)")
+    print("-" * 74)
+    di = [f for f in report.fairness_flags if "DISPARATE IMPACT" in f]
+    other = [f for f in report.fairness_flags if "DISPARATE IMPACT" not in f]
+    if di:
+        for flag in di:
+            print(f"  ⚑ {flag}")
+    else:
+        print("  No disparate impact detected across protected attributes.")
+    for flag in other:
+        print(f"  • {flag}")
+
+    print("\n" + "=" * 74)
+    print("Note: findings describe WHERE containment leaks. They do not prescribe a")
+    print("fix — that is the simulator + prescription layer. And nothing here is a")
+    print("validated truth until the Partner (validation + fairness) engine signs off.")
+    print("=" * 74)
+
+
+if __name__ == "__main__":
+    main(plant_bias="--bias" in sys.argv)

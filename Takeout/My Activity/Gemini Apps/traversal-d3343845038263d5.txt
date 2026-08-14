@@ -1,0 +1,327 @@
+"""
+traversal.py — Run a caller through an IVR tree, with emotion EVOLVING each step.
+
+This is the behavioral heart of the harness, and the place the central thesis
+becomes mechanical: SEQUENCE controls the outcome. The same caller, run through
+two different orderings of the same options, can contain in one and bail in the
+other — because every node the caller passes through changes their emotional
+temperature, and temperature drives the next decision.
+
+THE EMOTIONAL TRAJECTORY (why sequence matters, made concrete)
+--------------------------------------------------------------
+A caller carries a `temperature` that starts at their disposition's base and moves
+as they traverse:
+  * Each menu layer they pass WITHOUT resolving adds a little heat (effort cost).
+  * Hitting a long, irrelevant menu when hot adds more (the system isn't listening).
+  * A SELF_SERVE that resolves cools them (success). One that fails heats them a lot.
+  * A slow/failed DATA_DIP (dead air mid-flow) heats them.
+  * An AUTH loop heats them with each failed attempt.
+  * Being offered the thing they actually want EARLY keeps them cool (acknowledged).
+Because heat accumulates along the path, the ORDER of nodes changes the final
+temperature, and temperature decides whether they self-serve, pound out, or hang
+up. That is the whole "re-arrange the menu and change behavior" thesis, expressed
+as a trajectory rather than asserted.
+
+THE THREE CALLER REACTIONS (kept distinct, per the domain model)
+----------------------------------------------------------------
+  * POUNDOUT — annoyance. At a MENU, if temperature is high AND the caller's self-
+    serve affinity is low, they may mash zero and demand a human. About the IVR
+    experience, not the wait.
+  * HANGUP — patience exceeded. As effort accumulates beyond their patience, they
+    may abandon. About cost/time, not the menu itself.
+  * Reaching AGENT — a containment FAILURE the structure routed them to (or that an
+    unresolved self-serve / failed auth dumped them into).
+
+THE ROUTE-INTENT-VS-OUTCOME GAP (the real lie to catch)
+-------------------------------------------------------
+A SELF_SERVE node has `resolve_prob < 1`. When it does NOT resolve, the caller did
+not get helped but DID leave automation — recorded as CONTAINED_UNRESOLVED (fake
+containment) if they give up there, or routed onward (often to AGENT) if they
+push on. This is the divergence between "looks handled" and "actually resolved"
+that the diagnostic engine exists to find. Without it there is no lie in the data.
+
+DETERMINISM
+-----------
+Traversal is stochastic but seeded: each caller gets a private RNG derived from a
+base seed + caller_id, so a given (population, tree, seed) reproduces exactly.
+This matters because the simulator compares two trees on the SAME population and
+must attribute any difference to the STRUCTURE, not to RNG noise.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+import numpy as np
+
+from ivr_tree import IVRTree, Node, NodeKind, Option, Outcome
+from caller_model import Caller
+
+
+# --- tunable behavioral constants (ILLUSTRATIVE; documented, not validated) ---
+# These shape the trajectory. They are starting values chosen to produce sensible
+# behavior, NOT calibrated against real data. Labeled as such per the honesty rule.
+@dataclass
+class BehaviorParams:
+    heat_per_menu_step: float = 0.06       # effort cost of each menu passed
+    heat_irrelevant_menu: float = 0.05     # extra if a hot caller hits a big menu
+    cool_on_resolve: float = 0.30          # relief when self-serve actually works
+    heat_on_selfserve_fail: float = 0.22   # frustration when it doesn't
+    heat_on_dip_slow: float = 0.12         # dead air mid-flow
+    heat_on_auth_fail: float = 0.10        # per failed auth attempt
+    cool_offered_wanted_early: float = 0.08 # acknowledged: their option appears early
+    # decision thresholds
+    poundout_temp: float = 0.70            # above this, low-affinity callers may bail to agent
+    poundout_affinity: float = 0.45        # below this affinity, poundout is on the table
+    effort_patience_scale: float = 1.0     # how fast accumulated effort eats patience
+    max_steps: int = 25                    # safety ceiling on a journey
+
+
+@dataclass
+class Journey:
+    """The full record of one caller's trip through the tree. This is the row the
+    harness emits and the diagnostic engine consumes."""
+    caller_id: str
+    outcome: Outcome
+    path: List[str] = field(default_factory=list)        # node_ids visited, in order
+    steps: int = 0
+    final_temperature: float = 0.0
+    reached_agent: bool = False
+    poundout: bool = False
+    hung_up: bool = False
+    self_serve_attempted: bool = False
+    self_serve_resolved: bool = False
+    # whether the caller was offered the option matching their reason, and how early
+    wanted_offered: bool = False
+    wanted_offered_position: Optional[int] = None
+    notes: List[str] = field(default_factory=list)
+
+    @property
+    def contained(self) -> bool:
+        """Business definition: ended without a live agent. NOTE this counts BOTH
+        real (resolved) and fake (unresolved) containment — separating them is the
+        diagnostic engine's job, and the reason fake containment is dangerous."""
+        return self.outcome in (Outcome.CONTAINED_RESOLVED, Outcome.CONTAINED_UNRESOLVED)
+
+    @property
+    def truly_resolved(self) -> bool:
+        return self.outcome is Outcome.CONTAINED_RESOLVED
+
+
+def _caller_rng(caller_id: str, seed: int) -> np.random.Generator:
+    """A private, reproducible RNG per caller, so the same caller behaves
+    identically across tree variants (difference attributable to structure)."""
+    h = hashlib.sha256(f"{seed}:{caller_id}".encode()).digest()
+    return np.random.default_rng(int.from_bytes(h[:8], "big"))
+
+
+class TraversalEngine:
+    def __init__(self, params: Optional[BehaviorParams] = None, seed: int = 7):
+        self.p = params or BehaviorParams()
+        self.seed = seed
+
+    def run(self, caller: Caller, tree: IVRTree) -> Journey:
+        p = self.p
+        rng = _caller_rng(caller.caller_id, self.seed)
+        disp = caller.disposition
+        assert disp is not None, "caller must have a disposition to traverse"
+
+        temp = disp.base_temperature
+        effort = 0.0
+        j = Journey(caller_id=caller.caller_id, outcome=Outcome.HANGUP)
+
+        current_id = tree.entry_id
+        for _ in range(p.max_steps):
+            node = tree.node(current_id)
+            j.path.append(current_id)
+            j.steps += 1
+
+            # terminal nodes end the journey
+            if node.kind is NodeKind.AGENT:
+                j.outcome = Outcome.AGENT
+                j.reached_agent = True
+                break
+            if node.kind is NodeKind.HANGUP:
+                j.outcome = Outcome.HANGUP
+                j.hung_up = True
+                break
+
+            if node.kind is NodeKind.MENU:
+                result = self._menu(node, caller, rng, temp, effort, j)
+                if result is None:           # caller bailed (poundout or hangup); j set
+                    return self._finalize(j, temp)
+                next_id, dtemp, deffort = result
+                temp = _clip01(temp + dtemp)
+                effort += deffort
+                current_id = next_id
+
+            elif node.kind is NodeKind.SELF_SERVE:
+                next_id, dtemp = self._self_serve(node, rng, j)
+                temp = _clip01(temp + dtemp)
+                if next_id is None:           # resolved or gave up here; j.outcome set
+                    return self._finalize(j, temp)
+                current_id = next_id
+
+            elif node.kind is NodeKind.DATA_DIP:
+                next_id, dtemp = self._data_dip(node, rng, j)
+                temp = _clip01(temp + dtemp)
+                if next_id is None:
+                    return self._finalize(j, temp)
+                current_id = next_id
+
+            elif node.kind is NodeKind.AUTH:
+                next_id, dtemp = self._auth(node, rng, j)
+                temp = _clip01(temp + dtemp)
+                if next_id is None:
+                    return self._finalize(j, temp)
+                current_id = next_id
+
+            # after each step, check patience against accumulated effort
+            if self._patience_broken(disp, effort, temp, rng):
+                j.outcome = Outcome.HANGUP
+                j.hung_up = True
+                j.notes.append("hangup: effort exceeded patience")
+                return self._finalize(j, temp)
+
+        return self._finalize(j, temp)
+
+    # ---- node handlers ----
+
+    def _menu(self, node: Node, caller: Caller, rng, temp, effort, j: Journey):
+        """Returns (next_id, dtemp, deffort) or None if the caller bailed here."""
+        p = self.p
+        dtemp = p.heat_per_menu_step
+        # big menu while hot = "the system isn't listening"
+        if len(node.options) >= 4 and temp > 0.55:
+            dtemp += p.heat_irrelevant_menu
+
+        # Is the option the caller WANTS present, and where in the order?
+        want = caller.reason
+        wanted_pos = None
+        for idx, opt in enumerate(node.options):
+            if opt.intent_tag == want:
+                wanted_pos = idx
+                break
+        if wanted_pos is not None and not j.wanted_offered:
+            j.wanted_offered = True
+            j.wanted_offered_position = wanted_pos
+            # acknowledged early -> cooling; buried -> no cooling (and the heat above stands)
+            if wanted_pos == 0:
+                dtemp -= p.cool_offered_wanted_early
+
+        # POUNDOUT check: hot + low affinity -> may mash zero for an agent
+        if temp >= p.poundout_temp and caller.disposition.self_serve_affinity <= p.poundout_affinity:
+            # probability of poundout scales with how far over threshold they are
+            pr = min(1.0, (temp - p.poundout_temp) / (1.0 - p.poundout_temp) + 0.2)
+            if rng.random() < pr:
+                j.outcome = Outcome.POUNDOUT
+                j.poundout = True
+                j.reached_agent = True   # poundout heads to an agent
+                j.notes.append(f"poundout at menu '{node.node_id}' (temp={temp:.2f})")
+                return None
+
+        # Otherwise the caller chooses an option. Choice is biased toward the option
+        # matching their reason if present; else toward self-serve if affinity high,
+        # else toward an agent option if one is offered.
+        choice = self._choose_option(node, caller, rng, temp)
+        return (choice.target_id, dtemp, 1.0)
+
+    def _choose_option(self, node: Node, caller: Caller, rng, temp) -> Option:
+        opts = node.options
+        weights = np.ones(len(opts))
+        for i, o in enumerate(opts):
+            if o.intent_tag == caller.reason:
+                weights[i] += 3.0                       # strongly prefer the matching option
+            if o.intent_tag == "agent":
+                # hot or low-affinity callers weight the agent option up
+                weights[i] += 1.0 + 2.0 * temp + (1.0 - caller.disposition.self_serve_affinity)
+            if o.intent_tag == "self_serve" or node.kind is NodeKind.MENU:
+                weights[i] += caller.disposition.self_serve_affinity
+            # primacy: earlier options get a small lift (path of least resistance)
+            weights[i] += max(0.0, 0.5 - 0.1 * i)
+        weights = weights / weights.sum()
+        idx = rng.choice(len(opts), p=weights)
+        return opts[idx]
+
+    def _self_serve(self, node: Node, rng, j: Journey):
+        """Returns (next_id_or_None, dtemp). None means the journey ended here."""
+        p = self.p
+        j.self_serve_attempted = True
+        if rng.random() < node.resolve_prob:
+            j.self_serve_resolved = True
+            j.outcome = Outcome.CONTAINED_RESOLVED
+            j.notes.append(f"self-serve '{node.node_id}' resolved")
+            return None, -p.cool_on_resolve
+        # did NOT resolve: the route-intent-vs-outcome gap
+        j.notes.append(f"self-serve '{node.node_id}' did NOT resolve (fake-containment risk)")
+        if node.next_on_fail is not None:
+            # caller pushes on (often to an agent)
+            return node.next_on_fail, p.heat_on_selfserve_fail
+        # nowhere to go and unresolved: they leave "handled" but unresolved
+        j.outcome = Outcome.CONTAINED_UNRESOLVED
+        return None, p.heat_on_selfserve_fail
+
+    def _data_dip(self, node: Node, rng, j: Journey):
+        p = self.p
+        r = rng.random()
+        if r < node.fail_prob:
+            j.notes.append(f"data-dip '{node.node_id}' FAILED")
+            # a failed dip behaves like an unresolved self-serve: push on if possible
+            if node.next_id is not None:
+                return node.next_id, p.heat_on_selfserve_fail
+            j.outcome = Outcome.CONTAINED_UNRESOLVED
+            return None, p.heat_on_selfserve_fail
+        dtemp = 0.0
+        if r < node.fail_prob + node.slow_prob:
+            dtemp = p.heat_on_dip_slow              # dead air mid-flow
+            j.notes.append(f"data-dip '{node.node_id}' SLOW (dead air)")
+        return node.next_id, dtemp
+
+    def _auth(self, node: Node, rng, j: Journey):
+        p = self.p
+        dtemp = 0.0
+        for attempt in range(node.max_attempts):
+            if rng.random() < node.success_prob:
+                return node.next_on_success, dtemp
+            dtemp += p.heat_on_auth_fail
+            j.notes.append(f"auth '{node.node_id}' failed attempt {attempt+1}")
+        # exhausted attempts -> bail to an agent if the node points onward, else give up
+        j.notes.append(f"auth '{node.node_id}' exhausted -> agent")
+        if node.next_on_success is not None:
+            # in practice a failed-auth caller is routed to an agent; model as reaching agent
+            j.outcome = Outcome.AGENT
+            j.reached_agent = True
+            return None, dtemp
+        j.outcome = Outcome.CONTAINED_UNRESOLVED
+        return None, dtemp
+
+    # ---- helpers ----
+
+    def _patience_broken(self, disp, effort, temp, rng) -> bool:
+        """Hang-up when accumulated effort exceeds the caller's patience, scaled by
+        how hot they are. Stochastic so it's a tendency, not a hard cliff.
+
+        Calibration note (ILLUSTRATIVE): `effort` counts menu steps taken. A low-
+        patience, hot caller should start abandoning after a few steps; a calm,
+        patient one tolerates many. The scale below produces that shape but is not
+        validated against real abandonment curves."""
+        p = self.p
+        # effective patience shrinks as temperature rises (hot callers quit sooner)
+        eff_patience = disp.patience * (1.0 - 0.45 * temp)
+        # pressure grows with each step of effort; tuned so ~3-6 steps matters
+        pressure = effort * 0.18 * p.effort_patience_scale
+        if eff_patience <= 0.05:
+            return rng.random() < 0.5
+        # probability of giving up grows as pressure approaches/exceeds patience
+        pr = (pressure - eff_patience) / max(eff_patience, 1e-6)
+        return rng.random() < min(max(pr, 0.0), 0.85)
+
+    def _finalize(self, j: Journey, temp: float) -> Journey:
+        j.final_temperature = round(_clip01(temp), 4)
+        return j
+
+
+def _clip01(x: float) -> float:
+    return float(min(1.0, max(0.0, x)))

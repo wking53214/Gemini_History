@@ -1,0 +1,203 @@
+"""
+Job Queue
+=========
+
+Async job queue for heavy Bayesian engine runs.
+Manages provisional verdicts + reconciliation.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Dict, List, Optional
+from uuid import uuid4
+
+logger = logging.getLogger("OBSERVE_SCHEDULER")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(
+        "[OBSERVE_SCHEDULER] %(asctime)s %(levelname)s %(message)s"
+    ))
+    logger.addHandler(handler)
+
+
+# ============================================================
+# JOB STATE MACHINE
+# ============================================================
+
+class JobStatus(Enum):
+    """Lifecycle of a scheduled job."""
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    RECONCILED = "reconciled"
+
+
+# ============================================================
+# JOB DEFINITION
+# ============================================================
+
+@dataclass
+class ScheduledJob:
+    """Represents a queued heavy engine job."""
+    job_id: str = field(default_factory=lambda: str(uuid4())[:8])
+    patient_id: str = ""
+    engine_name: str = ""  # e.g., "bayesian_fusion"
+    vitals_snapshot: Dict = field(default_factory=dict)
+    status: JobStatus = JobStatus.QUEUED
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    provisional_verdict: Optional[Dict] = None
+    final_result: Optional[Dict] = None
+    error: Optional[str] = None
+    retry_count: int = 0
+    max_retries: int = 3
+
+
+# ============================================================
+# PROVISIONAL STORE
+# ============================================================
+
+class ProvisionalStore:
+    """Manages provisional verdicts while heavy jobs run."""
+
+    def __init__(self):
+        self.provisionals: Dict[str, Dict] = {}
+
+    def store_provisional(
+        self,
+        patient_id: str,
+        job_id: str,
+        risk_score: float,
+        confidence: float,
+        regime: str,
+    ) -> None:
+        """Store provisional verdict for immediate return."""
+        self.provisionals[patient_id] = {
+            "job_id": job_id,
+            "risk_score": risk_score,
+            "confidence": confidence,
+            "regime": regime,
+            "is_provisional": True,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        logger.info(f"Provisional verdict stored for {patient_id}")
+
+    def get_provisional(self, patient_id: str) -> Optional[Dict]:
+        """Retrieve provisional verdict."""
+        return self.provisionals.get(patient_id)
+
+    def reconcile(self, patient_id: str, final_result: Dict) -> None:
+        """Replace provisional with final result."""
+        if patient_id in self.provisionals:
+            self.provisionals[patient_id].update({
+                "is_provisional": False,
+                "final_result": final_result,
+                "reconciled_at": datetime.now(timezone.utc).isoformat(),
+            })
+            logger.info(f"Provisional verdict reconciled for {patient_id}")
+
+    def export_all(self) -> Dict[str, Dict]:
+        """Export all provisional verdicts."""
+        return self.provisionals.copy()
+
+
+# ============================================================
+# JOB QUEUE
+# ============================================================
+
+class JobQueue:
+    """Thread-safe job queue for async execution."""
+
+    def __init__(self, max_size: int = 1000):
+        self.queue: asyncio.Queue = None  # Initialized in async context
+        self.max_size = max_size
+        self.jobs: Dict[str, ScheduledJob] = {}
+        self.completed_jobs: List[ScheduledJob] = []
+
+    async def _init_queue(self):
+        """Initialize async queue (must be called in async context)."""
+        if self.queue is None:
+            self.queue = asyncio.Queue(maxsize=self.max_size)
+
+    async def enqueue(self, job: ScheduledJob) -> str:
+        """Add job to queue."""
+        await self._init_queue()
+        await self.queue.put(job)
+        self.jobs[job.job_id] = job
+        logger.info(f"Job {job.job_id} enqueued for {job.patient_id}")
+        return job.job_id
+
+    async def dequeue(self) -> Optional[ScheduledJob]:
+        """Remove job from queue."""
+        await self._init_queue()
+        try:
+            job = self.queue.get_nowait()
+            return job
+        except asyncio.QueueEmpty:
+            return None
+
+    async def dequeue_blocking(self, timeout: float = None) -> Optional[ScheduledJob]:
+        """Remove job from queue (blocking with timeout)."""
+        await self._init_queue()
+        try:
+            job = await asyncio.wait_for(self.queue.get(), timeout=timeout)
+            return job
+        except asyncio.TimeoutError:
+            return None
+
+    def get_job_status(self, job_id: str) -> Optional[JobStatus]:
+        """Get status of a job."""
+        if job_id in self.jobs:
+            return self.jobs[job_id].status
+        return None
+
+    def mark_running(self, job_id: str) -> None:
+        """Mark job as running."""
+        if job_id in self.jobs:
+            self.jobs[job_id].status = JobStatus.RUNNING
+            self.jobs[job_id].started_at = datetime.now(timezone.utc)
+
+    def mark_completed(self, job_id: str, result: Dict) -> None:
+        """Mark job as completed with result."""
+        if job_id in self.jobs:
+            job = self.jobs[job_id]
+            job.status = JobStatus.COMPLETED
+            job.final_result = result
+            job.completed_at = datetime.now(timezone.utc)
+            self.completed_jobs.append(job)
+            logger.info(f"Job {job_id} completed")
+
+    def mark_failed(self, job_id: str, error: str) -> None:
+        """Mark job as failed."""
+        if job_id in self.jobs:
+            job = self.jobs[job_id]
+            job.status = JobStatus.FAILED
+            job.error = error
+            job.completed_at = datetime.now(timezone.utc)
+            if job.retry_count < job.max_retries:
+                job.retry_count += 1
+                job.status = JobStatus.QUEUED
+                logger.warning(f"Job {job_id} failed, retry {job.retry_count}/{job.max_retries}")
+            else:
+                logger.error(f"Job {job_id} failed permanently: {error}")
+
+    def queue_size(self) -> int:
+        """Get current queue size."""
+        if self.queue is None:
+            return 0
+        return self.queue.qsize()
+
+    def export_jobs(self) -> Dict[str, Dict]:
+        """Export all jobs for audit."""
+        return {
+            job_id: asdict(job) | {"status": job.status.value}
+            for job_id, job in self.jobs.items()
+        }

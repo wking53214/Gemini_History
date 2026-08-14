@@ -1,0 +1,178 @@
+"""
+prescription_types.py — The result vocabulary of the prescription layer.
+
+This is the component that produces the number a CLIENT sees, so it is the most
+honesty-critical of all. The governing rule, from the build brief: a bare "+8%" is
+a credibility bomb. Every prescription must carry not just a projected lift but
+HOW MUCH TO TRUST IT, expressed as replication strength + support + sensitivity —
+never a lone percentage.
+
+THREE STRUCTURAL HONESTY DEVICES
+--------------------------------
+1. CONFIDENCE IS A BAND, NOT A NUMBER. `ConfidenceAssessment` carries the per-fold
+   estimates, the spread, the seed-sensitivity, and a categorical level with a
+   plain-language rationale. The point estimate never travels alone.
+
+2. REJECTION IS STRUCTURAL. A `Prescription` has a `status`: a change that is not a
+   clean win (false win / landmine / no improvement) is REJECTED_NOT_CLEAN; a clean
+   win that fails replication is REJECTED_GHOST. Only a clean win that replicates is
+   a CANDIDATE. You cannot accidentally surface a ghost as a recommendation.
+
+3. THE PARTNER SEAM + CLIENT-READY GATE. Every prescription carries validation and
+   fairness verdict slots (filled later by the Partner). `client_ready` is true only
+   when the status is CANDIDATE AND validation is REAL AND fairness is CLEAN. The
+   honest default is never client-ready.
+
+THE FEEDBACK LOOP
+-----------------
+`PrescriptionOutcome` records what was PROJECTED (the band) so that after a client
+implements the change, the ACTUAL measured effect can be compared and scored
+HIT / PARTIAL / MISS — openly. This is how the tool earns trust across engagements
+and how its confidence calibration improves. The discipline must survive being
+wrong in front of a client.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, List, Optional, Tuple
+
+# Reuse the Partner-seam verdict vocabulary from the diagnostic layer so the seam is
+# consistent across the whole system (UNASSESSED / REAL / GHOST / CLEAN / FLAGGED …).
+from diagnostic_types import Verdict
+from simulation_types import SimulationResult
+
+
+class ConfidenceLevel(str, Enum):
+    """How much to trust a projected lift. Derived from replication + support +
+    sensitivity, never asserted. NO_EFFECT and GHOST are not prescribable."""
+    NO_EFFECT = "NO_EFFECT"    # full-population effect is below the meaningful floor
+    GHOST = "GHOST"            # does not replicate across folds — do not trust
+    LOW = "LOW"                # replicates in sign but unstable / thin support
+    MODERATE = "MODERATE"      # replicates with moderate spread, decent support
+    HIGH = "HIGH"              # replicates tightly, large support, stable across seeds
+
+
+class PrescriptionStatus(str, Enum):
+    """Whether a proposed change became a recommendation. Structural so a rejected
+    change can never be mistaken for a live one."""
+    REJECTED_NOT_CLEAN = "REJECTED_NOT_CLEAN"  # simulator: false win / landmine / no improvement
+    REJECTED_GHOST = "REJECTED_GHOST"          # clean win, but fails replication
+    CANDIDATE = "CANDIDATE"                     # clean win that replicates — a real prescription candidate
+
+
+class OutcomeVerdict(str, Enum):
+    PENDING = "PENDING"        # implemented effect not yet measured
+    HIT = "HIT"               # actual landed within the projected band
+    PARTIAL = "PARTIAL"       # actual same direction but outside the band
+    MISS = "MISS"             # actual wrong direction or no effect
+
+
+@dataclass
+class ConfidenceAssessment:
+    """The honest confidence picture for a projected lift. The point estimate is
+    `full_delta`; everything else is the evidence for how much to trust it."""
+    method: str                            # "hold-out-and-replicate (k folds) + seed sensitivity"
+    full_delta: float                      # the full-population point estimate
+    fold_deltas: List[float]               # per-fold independent estimates (the band's source)
+    seed_deltas: List[float]               # full-pop estimate under different behavioral seeds
+    support: int                           # callers in the affected segment(s)
+    level: ConfidenceLevel
+    replicated: bool                       # consistent sign across folds
+    rationale: str = ""                    # plain-language why
+    caveats: List[str] = field(default_factory=list)
+
+    @property
+    def band(self) -> Tuple[float, float]:
+        """The empirical hold-out spread — the range of the effect across
+        independent subsamples. NOT a formal statistical CI; an honest spread."""
+        if not self.fold_deltas:
+            return (self.full_delta, self.full_delta)
+        return (min(self.fold_deltas), max(self.fold_deltas))
+
+    @property
+    def seed_band(self) -> Tuple[float, float]:
+        if not self.seed_deltas:
+            return (self.full_delta, self.full_delta)
+        return (min(self.seed_deltas), max(self.seed_deltas))
+
+    def describe(self) -> str:
+        lo, hi = self.band
+        slo, shi = self.seed_band
+        return (f"projected {self.full_delta*100:+.1f}pt containment "
+                f"[hold-out folds {lo*100:+.1f} to {hi*100:+.1f}pt; "
+                f"seeds {slo*100:+.1f} to {shi*100:+.1f}pt; "
+                f"support {self.support}]. Confidence: {self.level.value}.")
+
+
+@dataclass
+class Prescription:
+    """A proposed structural change, measured and confidence-assessed. Carries its
+    status (whether it survived), its confidence band, the Partner seam, and the
+    projected band for the feedback loop. A `change_fn` may be attached for
+    re-measurement but is NOT part of the serializable record."""
+    change_description: str
+    status: PrescriptionStatus
+    simulation: SimulationResult                 # the full distributional measurement
+    confidence: Optional[ConfidenceAssessment] = None
+    rejection_reason: str = ""
+    # Partner seam (empty until assessed) — client-ready requires both filled
+    validation_verdict: Verdict = Verdict.UNASSESSED
+    fairness_verdict: Verdict = Verdict.UNASSESSED
+    notes: List[str] = field(default_factory=list)
+    change_fn: object = field(default=None, repr=False)   # not serialized
+
+    @property
+    def client_ready(self) -> bool:
+        """Safe to put in front of a client ONLY if it is a replicating clean win
+        AND the Partner has validated it REAL and audited it CLEAN. The honest
+        default (UNASSESSED) is never client-ready."""
+        return (self.status == PrescriptionStatus.CANDIDATE
+                and self.confidence is not None
+                and self.confidence.level != ConfidenceLevel.GHOST
+                and self.confidence.level != ConfidenceLevel.NO_EFFECT
+                and self.validation_verdict == Verdict.REAL
+                and self.fairness_verdict == Verdict.CLEAN)
+
+    @property
+    def projected_band(self) -> Optional[Tuple[float, float]]:
+        return self.confidence.band if self.confidence else None
+
+    def one_line(self) -> str:
+        if self.status != PrescriptionStatus.CANDIDATE:
+            return f"[{self.status.value}] {self.change_description}: {self.rejection_reason}"
+        return f"[CANDIDATE] {self.change_description}: {self.confidence.describe()}"
+
+
+@dataclass
+class PrescriptionOutcome:
+    """The feedback-loop record: what was projected vs what actually happened after
+    the client implemented the change. Recorded openly, including misses — that is
+    how the tool earns trust and improves calibration over engagements."""
+    change_description: str
+    projected_delta: float
+    projected_band: Tuple[float, float]
+    actual_delta: Optional[float] = None
+    verdict: OutcomeVerdict = OutcomeVerdict.PENDING
+    note: str = ""
+
+    def score(self, actual_delta: float) -> "PrescriptionOutcome":
+        """Compare an actual measured containment delta to what was projected."""
+        self.actual_delta = actual_delta
+        lo, hi = self.projected_band
+        proj_sign = 1 if self.projected_delta >= 0 else -1
+        act_sign = 1 if actual_delta >= 0 else -1
+        if act_sign != proj_sign or abs(actual_delta) < 0.003:
+            self.verdict = OutcomeVerdict.MISS
+            self.note = (f"actual {actual_delta*100:+.1f}pt vs projected "
+                         f"{self.projected_delta*100:+.1f}pt — wrong direction or no effect")
+        elif lo <= actual_delta <= hi:
+            self.verdict = OutcomeVerdict.HIT
+            self.note = (f"actual {actual_delta*100:+.1f}pt landed within projected band "
+                         f"[{lo*100:+.1f}, {hi*100:+.1f}]pt")
+        else:
+            self.verdict = OutcomeVerdict.PARTIAL
+            self.note = (f"actual {actual_delta*100:+.1f}pt same direction but outside band "
+                         f"[{lo*100:+.1f}, {hi*100:+.1f}]pt")
+        return self

@@ -1,0 +1,101 @@
+"""
+run_prescription.py — Demonstrate the prescription layer end-to-end.
+
+Shows the full honest accounting for a set of proposed changes:
+  - a clean win that replicates -> a CANDIDATE with a confidence BAND
+  - a tiny clean win that does NOT replicate -> REJECTED_GHOST
+  - a false win -> REJECTED_NOT_CLEAN
+Then demonstrates the feedback loop: record what was projected, then score a
+(simulated) post-implementation actual as HIT / PARTIAL / MISS.
+
+The point: every number a client sees carries how much to trust it, and changes
+that do not earn trust are refused, openly.
+"""
+
+from __future__ import annotations
+
+from reference_tree import build_reference_tree
+from caller_model import PopulationGenerator, PopulationConfig
+from ivr_tree import Node, NodeKind
+from simulator import push_option_last, lead_with
+from prescription_engine import PrescriptionEngine
+from prescription_types import PrescriptionStatus
+
+
+def _trap_dispute(t):
+    tt = t.clone()
+    tt.nodes["dispute_deadend"] = Node("dispute_deadend", NodeKind.SELF_SERVE,
+        prompt="We have filed your dispute. Goodbye.", resolve_prob=0.0, next_on_fail=None)
+    tt.node("dispute_action").next_on_fail = "dispute_deadend"
+    n = tt.node("dispute_menu")
+    n.options = [o for o in n.options if o.target_id != "agent"]
+    return tt
+
+
+def main():
+    pop = PopulationGenerator(PopulationConfig(n=12000, seed=11)).generate()
+    observed = {c.caller_id: c.observed() for c in pop}
+    tree = build_reference_tree()
+
+    changes = [
+        ("push the agent option to the end of the main menu", push_option_last("entry", "agent")),
+        ("lead the main menu with the balance option", lead_with("entry", "balance")),
+        ("reroute dispute failures to a 'handled, goodbye' dead-end", _trap_dispute),
+    ]
+
+    eng = PrescriptionEngine(folds=5, seeds=(11, 23, 37))
+    prescriptions = eng.prescribe(tree, changes, pop, observed)
+
+    print("=" * 78)
+    print("PRESCRIPTION REPORT — every recommendation carries how much to trust it")
+    print("=" * 78, "\n")
+
+    candidates = [p for p in prescriptions if p.status == PrescriptionStatus.CANDIDATE]
+    rejected = [p for p in prescriptions if p.status != PrescriptionStatus.CANDIDATE]
+
+    print(f"CANDIDATES ({len(candidates)}) — survived clean-win + replication; pending Partner sign-off")
+    print("-" * 78)
+    for p in candidates:
+        c = p.confidence
+        lo, hi = c.band
+        print(f"  • {p.change_description}")
+        print(f"      {c.describe()}")
+        print(f"      why: {c.rationale}")
+        print(f"      client_ready: {p.client_ready}  (needs Partner validation REAL + fairness CLEAN)")
+        for cav in c.caveats:
+            print(f"      caveat: {cav}")
+        print()
+
+    print(f"REJECTED ({len(rejected)}) — checked and refused, with the reason")
+    print("-" * 78)
+    for p in rejected:
+        print(f"  • [{p.status.value}] {p.change_description}")
+        print(f"      {p.rejection_reason}")
+        print()
+
+    # ── feedback loop demonstration ──
+    if candidates:
+        p = candidates[0]
+        rec = eng.make_outcome_record(p)
+        print("=" * 78)
+        print("FEEDBACK LOOP — after the client implements, score actual vs projected")
+        print("-" * 78)
+        print(f"  prescription: {p.change_description}")
+        lo, hi = rec.projected_band
+        print(f"  projected: {rec.projected_delta*100:+.1f}pt  (band {lo*100:+.1f} to {hi*100:+.1f}pt)")
+        print()
+        # simulate three possible post-implementation realities
+        for label, actual in [("landed in band", (lo + hi) / 2),
+                              ("over-performed", hi + 0.02),
+                              ("did not move", 0.001)]:
+            import copy
+            scored = copy.deepcopy(rec).score(actual)
+            print(f"  if actual = {actual*100:+.1f}pt ({label}): {scored.verdict.value} — {scored.note}")
+        print()
+        print("  Misses are recorded openly. Over many engagements this is how the")
+        print("  tool earns trust and how its confidence calibration improves.")
+    print("=" * 78)
+
+
+if __name__ == "__main__":
+    main()

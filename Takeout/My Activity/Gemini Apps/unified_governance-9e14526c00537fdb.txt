@@ -1,0 +1,531 @@
+"""
+unified_governance.py — One governance spine for all domains.
+
+WHAT THIS IS
+------------
+A single framework that takes a risk signal from ANY domain (clinical
+early-warning, operational health, hiring decisions) and runs it through one
+shared pipeline:
+
+    domain adapter -> RiskSignal -> regime classify -> policy VM -> audit ledger
+
+The payoff of unification (this is the C3 design): one tamper-evident log
+spanning every domain, so cross-domain questions become answerable. "Show me
+every hiring decision for a candidate who later triggered an operational
+alert" is a single query against one ledger, not a join across three systems.
+
+THE COST, STATED HONESTLY
+-------------------------
+C3 is the highest-coupling option. One spine means one blast radius: a bug in
+the shared pipeline touches all three domains at once. Three mitigations:
+
+  1. Domains are PLUGGABLE, not merged. Each domain implements the
+     DomainAdapter protocol and stays in its own module. The clinical adapter
+     never imports the hiring adapter. They meet only at the RiskSignal
+     boundary.
+  2. The spine does GENERIC work only (classify, enforce, log). It contains
+     zero domain knowledge. It cannot, because it only ever sees a RiskSignal.
+  3. Per-domain policy and invariant sets are isolated. A clinical invariant
+     cannot fire on a hiring event because events are tagged by domain and
+     policies are filtered by domain before evaluation.
+
+WHAT THE SPINE DOES NOT DO
+--------------------------
+It does not validate domain correctness. A clinical adapter that scores sepsis
+wrong, or a hiring adapter that encodes bias, will be faithfully classified,
+enforced, and logged by this spine. Garbage in, governed garbage out. The
+spine guarantees provenance and policy enforcement, not that the upstream
+score is clinically or legally sound. Those guarantees live in the domain
+adapters and their own validation (see hiring_decision_auditor.py for the
+hiring side, the OBSERVE cartridge tests for the clinical side).
+"""
+
+from __future__ import annotations
+
+import copy
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, runtime_checkable
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# THE UNIVERSAL CURRENCY: RiskSignal
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Domain(str, Enum):
+    """Which domain produced a signal. Events are tagged so policies and
+    invariants for one domain never fire on another's events."""
+    CLINICAL = "clinical"
+    OPERATIONAL = "operational"
+    HIRING = "hiring"
+
+
+@dataclass(frozen=True)
+class RiskSignal:
+    """
+    The single data structure every domain reduces to. This is the only thing
+    the spine ever sees. The spine has no idea whether `score` came from a
+    sepsis detector, a gateway health engine, or a resume scorer.
+
+    Fields
+    ------
+    entity_id    : the thing being governed (patient pseudonym, service name,
+                   candidate id). One ledger stream per entity.
+    domain       : which domain produced this (tags the event).
+    score        : normalized risk on [0, 1]. 0 = no concern, 1 = maximal.
+    confidence   : 0..1 trust in the score. Low confidence can abstain from
+                   enforcement. Domains that don't model confidence pass 1.0.
+    features     : domain-specific detail, for audit and for policy predicates.
+                   The spine never interprets these; policies may.
+    actor_id     : who/what produced the decision (for provenance).
+    justification: human-readable reason (for provenance).
+    timestamp    : when (UTC ISO 8601).
+    """
+    entity_id: str
+    domain: Domain
+    score: float
+    confidence: float
+    features: Dict[str, Any] = field(default_factory=dict)
+    actor_id: str = "unknown"
+    justification: str = ""
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    def __post_init__(self):
+        # Validate at the boundary so bad signals never enter the spine.
+        if not (0.0 <= self.score <= 1.0):
+            raise ValueError(f"RiskSignal.score must be [0,1], got {self.score}")
+        if not (0.0 <= self.confidence <= 1.0):
+            raise ValueError(f"RiskSignal.confidence must be [0,1], got {self.confidence}")
+        if not self.entity_id:
+            raise ValueError("RiskSignal.entity_id must be non-empty")
+
+
+@runtime_checkable
+class DomainAdapter(Protocol):
+    """
+    The contract a domain implements to plug into the spine. One method:
+    turn whatever the domain produces into a RiskSignal.
+
+    The clinical adapter turns a fused vitals risk into a RiskSignal. The
+    operational adapter turns a URE ClassificationResult into one. The hiring
+    adapter turns candidate scoring signals into one. The spine doesn't know or
+    care which is which.
+    """
+    domain: Domain
+
+    def to_risk_signal(self, raw: Any) -> RiskSignal:
+        ...
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VERDICTS AND REGIMES (re-exported as spine-level concepts)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Verdict(str, Enum):
+    """What the policy engine decides should happen to an entity."""
+    ALLOW = "allow"        # proceed normally
+    THROTTLE = "throttle"  # proceed but rate-limit / slow / flag for review
+    ISOLATE = "isolate"    # quarantine this entity; stop automated action, escalate
+    HALT = "halt"          # stop the whole pipeline; a system-level problem
+
+
+VERDICT_SEVERITY = {
+    Verdict.ALLOW: 0,
+    Verdict.THROTTLE: 1,
+    Verdict.ISOLATE: 2,
+    Verdict.HALT: 3,
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAMPER-EVIDENT UNIFIED LEDGER
+# ─────────────────────────────────────────────────────────────────────────────
+
+import hashlib
+import json
+import threading
+
+
+def _canonical(obj: Any) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+
+
+@dataclass(frozen=True)
+class UnifiedEvent:
+    """One entry in the unified ledger. Carries the domain tag so cross-domain
+    queries can filter, and the full risk signal + verdict for provenance."""
+    event_id: str
+    entity_id: str
+    domain: Domain
+    sequence_no: int
+    score: float
+    confidence: float
+    regime: str
+    verdict: Verdict
+    triggered_policies: List[str]
+    features: Dict[str, Any]
+    actor_id: str
+    justification: str
+    timestamp: str
+    entry_hash: str = ""
+
+
+class UnifiedLedger:
+    """
+    One hash-chained, append-only ledger for ALL domains.
+
+    Tamper-EVIDENT, not tamper-PROOF: verify() detects any edit to a sealed
+    entry or any break in the chain, but does not stop an attacker who can
+    rewrite the entire log and recompute every hash. For stronger guarantees,
+    anchor the tip hash externally (notary, timestamping service). Thread-safe.
+
+    The unification payoff lives here: because every domain writes to this one
+    ledger, you can query across domains. See query_* methods.
+    """
+
+    GENESIS = hashlib.sha256(b"unified-genesis").hexdigest()
+
+    def __init__(self) -> None:
+        self._entries: List[UnifiedEvent] = []
+        self._tip = self.GENESIS
+        self._seq_by_entity: Dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def _seal_body(self, e: UnifiedEvent) -> str:
+        return _canonical({
+            "event_id": e.event_id,
+            "entity_id": e.entity_id,
+            "domain": e.domain.value,
+            "sequence_no": e.sequence_no,
+            "score": round(e.score, 10),
+            "confidence": round(e.confidence, 10),
+            "regime": e.regime,
+            "verdict": e.verdict.value,
+            "triggered_policies": e.triggered_policies,
+            "features": e.features,
+            "actor_id": e.actor_id,
+            "justification": e.justification,
+            "timestamp": e.timestamp,
+        })
+
+    def append(
+        self,
+        signal: RiskSignal,
+        regime: str,
+        verdict: Verdict,
+        triggered_policies: List[str],
+    ) -> UnifiedEvent:
+        with self._lock:
+            seq = self._seq_by_entity.get(signal.entity_id, 0) + 1
+            self._seq_by_entity[signal.entity_id] = seq
+
+            event = UnifiedEvent(
+                event_id=str(uuid.uuid4()),
+                entity_id=signal.entity_id,
+                domain=signal.domain,
+                sequence_no=seq,
+                score=signal.score,
+                confidence=signal.confidence,
+                regime=regime,
+                verdict=verdict,
+                triggered_policies=list(triggered_policies),
+                features=copy.deepcopy(signal.features),
+                actor_id=signal.actor_id,
+                justification=signal.justification,
+                timestamp=signal.timestamp,
+            )
+            body = self._seal_body(event)
+            entry_hash = hashlib.sha256(body.encode()).hexdigest()
+            object.__setattr__(event, "entry_hash", entry_hash)
+            self._tip = hashlib.sha256(f"{self._tip}:{entry_hash}".encode()).hexdigest()
+            self._entries.append(event)
+            return event
+
+    def verify(self) -> bool:
+        with self._lock:
+            tip = self.GENESIS
+            for e in self._entries:
+                recomputed = hashlib.sha256(self._seal_body(e).encode()).hexdigest()
+                if recomputed != e.entry_hash:
+                    return False
+                tip = hashlib.sha256(f"{tip}:{e.entry_hash}".encode()).hexdigest()
+            return tip == self._tip
+
+    @property
+    def tip(self) -> str:
+        return self._tip
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    # ── Cross-domain queries: the reason C3 exists ──────────────────────────
+
+    def all_events(self) -> List[UnifiedEvent]:
+        with self._lock:
+            return list(self._entries)
+
+    def events_for_entity(self, entity_id: str) -> List[UnifiedEvent]:
+        with self._lock:
+            return [e for e in self._entries if e.entity_id == entity_id]
+
+    def events_for_domain(self, domain: Domain) -> List[UnifiedEvent]:
+        with self._lock:
+            return [e for e in self._entries if e.domain == domain]
+
+    def events_with_verdict(self, verdict: Verdict) -> List[UnifiedEvent]:
+        with self._lock:
+            return [e for e in self._entries if e.verdict == verdict]
+
+    def entities_flagged_in(self, domain: Domain, min_verdict: Verdict) -> List[str]:
+        """Entities that hit at least `min_verdict` severity in a given domain.
+        The building block for cross-domain correlation."""
+        threshold = VERDICT_SEVERITY[min_verdict]
+        with self._lock:
+            return sorted({
+                e.entity_id for e in self._entries
+                if e.domain == domain and VERDICT_SEVERITY[e.verdict] >= threshold
+            })
+
+    def cross_domain_correlation(
+        self,
+        domain_a: Domain,
+        domain_b: Domain,
+        min_verdict: Verdict = Verdict.ISOLATE,
+    ) -> List[str]:
+        """
+        Entities that were flagged at >= min_verdict in BOTH domains.
+
+        This is the query C3 makes possible: "which candidates flagged in
+        hiring were ALSO flagged in operational monitoring?" In a federated
+        (C1/C2) design this needs a cross-system join; here it's one pass over
+        one ledger.
+        """
+        a = set(self.entities_flagged_in(domain_a, min_verdict))
+        b = set(self.entities_flagged_in(domain_b, min_verdict))
+        return sorted(a & b)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POLICY ENGINE (domain-filtered)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class Policy:
+    """
+    A policy: a predicate over (signal, regime) and the verdict it yields when
+    the predicate is true. Tagged by domain so it only ever sees its own
+    domain's signals.
+
+    `applies_to=None` means the policy is domain-agnostic (e.g. a global
+    "HALT if confidence is zero" safety rule).
+    """
+    name: str
+    predicate: Callable[[RiskSignal, str], bool]
+    verdict: Verdict
+    applies_to: Optional[Domain] = None
+
+
+class PolicyEngine:
+    """
+    Evaluates policies against a signal and returns the most severe verdict.
+
+    Policies are filtered by domain first: a clinical policy never sees a
+    hiring signal. Within the applicable set, every matching policy's verdict
+    is collected and the MOST SEVERE one wins (fail-safe: if any policy says
+    ISOLATE and another says ALLOW, the entity is isolated).
+    """
+
+    def __init__(self, policies: List[Policy]):
+        # Deterministic order for reproducible audit.
+        self._policies = sorted(policies, key=lambda p: p.name)
+
+    def evaluate(self, signal: RiskSignal, regime: str) -> Tuple[Verdict, List[str]]:
+        applicable = [
+            p for p in self._policies
+            if p.applies_to is None or p.applies_to == signal.domain
+        ]
+        triggered: List[str] = []
+        verdict = Verdict.ALLOW
+        for p in applicable:
+            try:
+                if p.predicate(signal, regime):
+                    triggered.append(p.name)
+                    if VERDICT_SEVERITY[p.verdict] > VERDICT_SEVERITY[verdict]:
+                        verdict = p.verdict
+            except Exception as exc:
+                # A broken predicate must not silently pass. Escalate to ISOLATE
+                # and record the failure: fail safe, not fail open.
+                triggered.append(f"{p.name}__PREDICATE_ERROR")
+                if VERDICT_SEVERITY[Verdict.ISOLATE] > VERDICT_SEVERITY[verdict]:
+                    verdict = Verdict.ISOLATE
+        return verdict, triggered
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INVARIANTS (domain-filtered structural checks)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class Invariant:
+    """
+    A structural rule that must hold for an event. Unlike a policy (which
+    decides a verdict), an invariant ASSERTS something is true and flags a
+    breach if not. Example: "an ISOLATE verdict must carry a non-empty
+    justification." Tagged by domain like policies.
+    """
+    name: str
+    check: Callable[[UnifiedEvent], Tuple[bool, str]]
+    applies_to: Optional[Domain] = None
+
+
+class InvariantAuditor:
+    """Runs invariants against an event, returns any breaches."""
+
+    def __init__(self, invariants: List[Invariant]):
+        self._invariants = sorted(invariants, key=lambda i: i.name)
+
+    def check(self, event: UnifiedEvent) -> List[str]:
+        breaches: List[str] = []
+        for inv in self._invariants:
+            if inv.applies_to is not None and inv.applies_to != event.domain:
+                continue
+            try:
+                ok, msg = inv.check(event)
+                if not ok:
+                    breaches.append(f"{inv.name}: {msg}")
+            except Exception as exc:
+                breaches.append(f"{inv.name}: INVARIANT_ERROR: {exc}")
+        return breaches
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# THE SPINE: tie it all together
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class GovernanceResult:
+    """What the spine returns for one governed signal."""
+    entity_id: str
+    domain: Domain
+    score: float
+    regime: str
+    verdict: Verdict
+    triggered_policies: List[str]
+    invariant_breaches: List[str]
+    event: UnifiedEvent
+
+
+# A regime classifier is anything that turns a RiskSignal into a regime label.
+# We keep it as a simple callable so domains can supply their own (URE for
+# operational, a simple band classifier for clinical, etc.) without the spine
+# depending on any particular one.
+RegimeClassifierFn = Callable[[RiskSignal], str]
+
+
+def default_regime_classifier(signal: RiskSignal) -> str:
+    """
+    A minimal, domain-agnostic regime classifier based on score bands. Domains
+    that want richer regime logic (like the URE engine's six-regime model for
+    operational health) supply their own classifier to the spine instead.
+    """
+    s = signal.score
+    if s < 0.25:
+        return "NOMINAL"
+    if s < 0.50:
+        return "ELEVATED"
+    if s < 0.75:
+        return "HIGH"
+    return "CRITICAL"
+
+
+class UnifiedGovernanceSpine:
+    """
+    The C3 spine. One instance governs all domains.
+
+    Pipeline per signal:
+        1. classify regime (domain-supplied or default classifier)
+        2. evaluate policies (domain-filtered) -> verdict
+        3. append to the unified ledger (tamper-evident, cross-domain)
+        4. check invariants on the resulting event (domain-filtered)
+        5. return the full result
+
+    The spine holds no domain knowledge. Domains register their adapter,
+    policies, invariants, and (optionally) a regime classifier.
+    """
+
+    def __init__(
+        self,
+        policy_engine: Optional[PolicyEngine] = None,
+        invariant_auditor: Optional[InvariantAuditor] = None,
+        ledger: Optional[UnifiedLedger] = None,
+    ):
+        self._policy_engine = policy_engine or PolicyEngine([])
+        self._invariant_auditor = invariant_auditor or InvariantAuditor([])
+        self._ledger = ledger or UnifiedLedger()
+        # Per-domain regime classifiers; falls back to default if none set.
+        self._regime_classifiers: Dict[Domain, RegimeClassifierFn] = {}
+
+    @property
+    def ledger(self) -> UnifiedLedger:
+        return self._ledger
+
+    def set_regime_classifier(self, domain: Domain, fn: RegimeClassifierFn) -> None:
+        """Let a domain supply its own regime logic (e.g. URE for operational)."""
+        self._regime_classifiers[domain] = fn
+
+    def govern(self, signal: RiskSignal) -> GovernanceResult:
+        """Run one signal through the full pipeline."""
+        classifier = self._regime_classifiers.get(signal.domain, default_regime_classifier)
+        regime = classifier(signal)
+
+        verdict, triggered = self._policy_engine.evaluate(signal, regime)
+        event = self._ledger.append(signal, regime, verdict, triggered)
+        breaches = self._invariant_auditor.check(event)
+
+        return GovernanceResult(
+            entity_id=signal.entity_id,
+            domain=signal.domain,
+            score=signal.score,
+            regime=regime,
+            verdict=verdict,
+            triggered_policies=triggered,
+            invariant_breaches=breaches,
+            event=event,
+        )
+
+    def govern_raw(self, adapter: DomainAdapter, raw: Any) -> GovernanceResult:
+        """Convenience: adapt a raw domain object to a signal, then govern it."""
+        signal = adapter.to_risk_signal(raw)
+        return self.govern(signal)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UNIVERSAL SAFETY INVARIANTS (domain-agnostic, always on)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def isolate_requires_justification(event: UnifiedEvent) -> Tuple[bool, str]:
+    """Any ISOLATE or HALT verdict must carry a non-empty justification.
+    Litigation-readiness: a quarantine with no stated reason is a breach."""
+    if event.verdict in (Verdict.ISOLATE, Verdict.HALT) and not event.justification.strip():
+        return False, f"{event.verdict.value} verdict with empty justification"
+    return True, "OK"
+
+
+def score_confidence_coherence(event: UnifiedEvent) -> Tuple[bool, str]:
+    """A high-severity verdict driven by a near-zero-confidence signal is
+    suspicious. Flag HALT/ISOLATE when confidence < 0.2 so a noise spike can't
+    silently shut things down without review."""
+    if event.verdict in (Verdict.ISOLATE, Verdict.HALT) and event.confidence < 0.2:
+        return False, (
+            f"{event.verdict.value} on low-confidence signal "
+            f"({event.confidence:.2f}); review before acting"
+        )
+    return True, "OK"
+
+
+UNIVERSAL_INVARIANTS = [
+    Invariant("isolate_requires_justification", isolate_requires_justification),
+    Invariant("score_confidence_coherence", score_confidence_coherence),
+]

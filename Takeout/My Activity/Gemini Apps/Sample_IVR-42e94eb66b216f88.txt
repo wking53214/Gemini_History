@@ -1,0 +1,193 @@
+"""
+Theoretical Natural Language IVR Framework
+Federal-Style, Compliance-Heavy Design
+"""
+
+from enum import Enum
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional
+import datetime
+
+
+# -----------------------------
+# ENUMS AND CONSTANTS
+# -----------------------------
+
+class IntentCategory(Enum):
+    GENERAL_STATUS = "general_status"
+    PAYMENT = "payment"
+    DOCUMENTS = "documents"
+    REPAYMENT_INFO = "repayment_info"
+    ELIGIBILITY = "eligibility"
+    HELP = "help"
+    COMPLIANCE = "compliance"
+    UNKNOWN = "unknown"
+
+
+class InteractionOutcome(Enum):
+    AUTOMATED_RESPONSE = "automated_response"
+    AGENT_HANDOFF = "agent_handoff"
+    TERMINATED = "terminated"
+
+
+# -----------------------------
+# DATA MODELS
+# -----------------------------
+
+@dataclass
+class BorrowerContext:
+    borrower_id: Optional[str] = None
+    authenticated: bool = False
+    language: str = "en"
+    consent_active: bool = False
+
+
+@dataclass
+class IntentResult:
+    intent: IntentCategory
+    confidence: float
+    raw_utterance: str
+    timestamp: datetime.datetime = field(default_factory=datetime.datetime.utcnow)
+
+
+@dataclass
+class InteractionLog:
+    borrower_id: Optional[str]
+    intent: IntentCategory
+    confidence: float
+    outcome: InteractionOutcome
+    timestamp: datetime.datetime
+    notes: str = ""
+
+
+# -----------------------------
+# NLU LAYER (THEORETICAL)
+# -----------------------------
+
+class NLUProcessor:
+    CONFIDENCE_THRESHOLD = 0.70
+
+    INTENT_KEYWORDS = {
+        IntentCategory.GENERAL_STATUS: ["balance", "status", "owe"],
+        IntentCategory.PAYMENT: ["pay", "payment", "make a payment"],
+        IntentCategory.DOCUMENTS: ["statement", "documents", "letter"],
+        IntentCategory.REPAYMENT_INFO: ["repayment", "lower", "options"],
+        IntentCategory.ELIGIBILITY: ["qualify", "eligible", "forgiveness"],
+        IntentCategory.HELP: ["agent", "representative", "talk to someone"],
+        IntentCategory.COMPLIANCE: ["complaint", "escalation", "issue"],
+    }
+
+    def classify(self, utterance: str) -> IntentResult:
+        utterance_lower = utterance.lower()
+        for intent, keywords in self.INTENT_KEYWORDS.items():
+            for keyword in keywords:
+                if keyword in utterance_lower:
+                    return IntentResult(
+                        intent=intent,
+                        confidence=0.90,
+                        raw_utterance=utterance
+                    )
+
+        return IntentResult(
+            intent=IntentCategory.UNKNOWN,
+            confidence=0.40,
+            raw_utterance=utterance
+        )
+
+
+# -----------------------------
+# POLICY AND AUTHORIZATION
+# -----------------------------
+
+class PolicyEngine:
+    @staticmethod
+    def is_intent_allowed(intent: IntentCategory, context: BorrowerContext) -> bool:
+        if intent in [
+            IntentCategory.GENERAL_STATUS,
+            IntentCategory.DOCUMENTS,
+            IntentCategory.PAYMENT,
+        ]:
+            return context.authenticated
+        if intent in [
+            IntentCategory.REPAYMENT_INFO,
+            IntentCategory.ELIGIBILITY,
+        ]:
+            return context.authenticated
+        if intent in [
+            IntentCategory.HELP,
+            IntentCategory.COMPLIANCE,
+        ]:
+            return True
+
+        return False
+
+
+# -----------------------------
+# ORCHESTRATION LAYER
+# -----------------------------
+
+class IVROrchestrator:
+    def __init__(self):
+        self.nlu = NLUProcessor()
+        self.logs: List[InteractionLog] = []
+
+    def handle_utterance(self, utterance: str, context: BorrowerContext) -> InteractionOutcome:
+        result = self.nlu.classify(utterance)
+
+        if result.confidence < self.nlu.CONFIDENCE_THRESHOLD:
+            outcome = InteractionOutcome.AGENT_HANDOFF
+            self._log(context, result, outcome, "Low confidence intent")
+            return outcome
+
+        if not PolicyEngine.is_intent_allowed(result.intent, context):
+            outcome = InteractionOutcome.AGENT_HANDOFF
+            self._log(context, result, outcome, "Authorization failure")
+            return outcome
+
+        if result.intent == IntentCategory.HELP:
+            outcome = InteractionOutcome.AGENT_HANDOFF
+        elif result.intent == IntentCategory.UNKNOWN:
+            outcome = InteractionOutcome.AGENT_HANDOFF
+        else:
+            outcome = InteractionOutcome.AUTOMATED_RESPONSE
+
+        self._log(context, result, outcome, "Processed normally")
+        return outcome
+
+    def _log(
+        self,
+        context: BorrowerContext,
+        result: IntentResult,
+        outcome: InteractionOutcome,
+        notes: str,
+    ):
+        self.logs.append(
+            InteractionLog(
+                borrower_id=context.borrower_id,
+                intent=result.intent,
+                confidence=result.confidence,
+                outcome=outcome,
+                timestamp=result.timestamp,
+                notes=notes,
+            )
+        )
+
+
+# -----------------------------
+# EXAMPLE USAGE
+# -----------------------------
+
+if __name__ == "__main__":
+    context = BorrowerContext(
+        borrower_id="B123456",
+        authenticated=True,
+        consent_active=True,
+    )
+
+    ivr = IVROrchestrator()
+    outcome = ivr.handle_utterance(
+        "I want to know my balance",
+        context
+    )
+
+    print("Outcome:", outcome.value)

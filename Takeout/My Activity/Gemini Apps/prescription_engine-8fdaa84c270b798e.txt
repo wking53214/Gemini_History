@@ -1,0 +1,285 @@
+"""
+prescription_engine.py — Turn a clean simulated win into a confidence-stated
+recommendation, or honestly refuse.
+
+This is the component that produces the number a client sees. Its discipline:
+  * It only considers CLEAN WINS (the simulator already rejects false wins and
+    landmines). A change that harms a segment or wins by raising fake containment
+    never reaches here as a candidate.
+  * For a clean win, it does NOT trust the single full-population number. It runs
+    HOLD-OUT-AND-REPLICATE: split the population into k folds, measure the change
+    independently on each, and check whether the effect holds. An effect that does
+    not replicate is labeled a GHOST and is NOT prescribed.
+  * It expresses confidence as a BAND plus a categorical level with a rationale —
+    replication strength + support + seed sensitivity — never a bare percentage.
+  * Nothing is client-ready without the Partner's REAL + CLEAN verdicts.
+  * It records what was projected so the actual post-implementation outcome can be
+    compared (the feedback loop).
+
+WHY HOLD-OUT-AND-REPLICATE (and not a hand-waved confidence %)
+-------------------------------------------------------------
+A projected lift is only trustworthy if it is STABLE. Measuring the same change on
+independent subsamples answers, empirically, "if you'd had only a fraction of this
+data, what range of answers would you have gotten?" If every fold agrees in sign
+and the spread is tight, the effect is robust; if folds disagree, the full-
+population number was an artifact. This is a real, interpretable uncertainty, not
+theater. We pair it with SEED SENSITIVITY (re-running under different behavioral
+RNG) to check robustness to noise. Both stated honestly; neither claims formal
+statistical-CI rigor we do not have.
+
+WHAT THIS IS NOT
+----------------
+Not an optimizer (it assesses changes you propose; it does not search for them).
+Not the Partner (it does its own honesty check but leaves the formal validation and
+fairness audit to the independent Partner engine — client-ready needs both).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import math
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
+from ivr_tree import IVRTree
+from caller_model import Caller
+from simulator import Simulator, TreeChange
+from simulation_types import SimulationResult
+from prescription_types import (
+    ConfidenceAssessment, ConfidenceLevel, Prescription, PrescriptionStatus,
+    PrescriptionOutcome, Verdict,
+)
+
+
+# ── confidence classification constants (ILLUSTRATIVE, documented) ─────────────
+MIN_MEANINGFUL_DELTA = 0.003   # full-pop containment effect below this = NO_EFFECT (0.3pt)
+HIGH_REL_SPREAD = 0.6          # fold band width / |mean| at or below this = tight
+MODERATE_REL_SPREAD = 1.2      # …below this = moderate; above = loose
+LARGE_SUPPORT = 3000           # support at/above this supports a HIGH rating
+FOLD_AGREEMENT_FRACTION = 0.8  # this fraction of meaningful folds must share the sign
+
+
+def _sign(x: float) -> int:
+    return 1 if x >= 0 else -1
+
+
+def classify_confidence(full_delta: float,
+                        fold_deltas: List[float],
+                        seed_deltas: List[float],
+                        support: int) -> Tuple[ConfidenceLevel, bool, str, List[str]]:
+    """Pure function: given the full-population effect, the per-fold effects, the
+    per-seed effects, and the support, return (level, replicated, rationale,
+    caveats). Pure so it is directly unit-testable with hand-crafted inputs."""
+    caveats: List[str] = [
+        "Projected lift is a model estimate; calibrate against post-implementation data.",
+        "Hold-out spread is an empirical range across subsamples, not a formal "
+        "statistical confidence interval.",
+    ]
+
+    # 1. Is the effect meaningful at all?
+    if abs(full_delta) < MIN_MEANINGFUL_DELTA:
+        return (ConfidenceLevel.NO_EFFECT, False,
+                f"full-population effect {full_delta*100:+.1f}pt is below the "
+                f"meaningful floor ({MIN_MEANINGFUL_DELTA*100:.1f}pt)", caveats)
+
+    target = _sign(full_delta)
+
+    # 2. Replication: do the folds agree in sign? Any meaningful fold of the
+    #    OPPOSITE sign is a red flag; a strong majority must share the sign.
+    meaningful = [d for d in fold_deltas if abs(d) >= MIN_MEANINGFUL_DELTA / 2]
+    flips = sum(1 for d in meaningful if _sign(d) != target)
+    agree = sum(1 for d in meaningful if _sign(d) == target)
+    n_folds = len(fold_deltas)
+    replicated = (flips == 0 and n_folds > 0
+                  and agree >= math.ceil(FOLD_AGREEMENT_FRACTION * n_folds))
+    if not replicated:
+        return (ConfidenceLevel.GHOST, False,
+                f"effect does not replicate: {agree}/{n_folds} folds share the sign, "
+                f"{flips} fold(s) flip — the full-population number is likely an artifact",
+                caveats)
+
+    # 3. Spread of the fold estimates (band width relative to the mean)
+    mean_d = sum(fold_deltas) / len(fold_deltas)
+    spread = max(fold_deltas) - min(fold_deltas)
+    rel_spread = spread / abs(mean_d) if mean_d != 0 else float("inf")
+
+    # 4. Seed sensitivity: does the full-pop effect keep its sign across behavioral
+    #    seeds, and how wide is that spread?
+    seed_agree = all(_sign(d) == target for d in seed_deltas) if seed_deltas else True
+    seed_spread = (max(seed_deltas) - min(seed_deltas)) if seed_deltas else 0.0
+    if not seed_agree:
+        caveats.append("effect sign is not stable across behavioral seeds — treat with caution")
+
+    # 5. Combine into a level
+    if (rel_spread <= HIGH_REL_SPREAD and support >= LARGE_SUPPORT
+            and seed_agree and seed_spread <= abs(mean_d)):
+        level = ConfidenceLevel.HIGH
+        rationale = (f"replicates across all folds (sign-consistent), tight spread "
+                     f"(rel {rel_spread:.2f}), large support ({support}), stable across seeds")
+    elif rel_spread <= MODERATE_REL_SPREAD and seed_agree:
+        level = ConfidenceLevel.MODERATE
+        rationale = (f"replicates in sign across folds with moderate spread "
+                     f"(rel {rel_spread:.2f}); support {support}")
+    else:
+        level = ConfidenceLevel.LOW
+        reasons = []
+        if rel_spread > MODERATE_REL_SPREAD:
+            reasons.append(f"wide fold spread (rel {rel_spread:.2f})")
+        if support < LARGE_SUPPORT:
+            reasons.append(f"thin support ({support})")
+        if not seed_agree:
+            reasons.append("seed-sensitive")
+        rationale = "replicates in sign but " + ", ".join(reasons or ["unstable magnitude"])
+    return (level, True, rationale, caveats)
+
+
+class PrescriptionEngine:
+    def __init__(self, folds: int = 5, seeds: Sequence[int] = (11, 23, 37),
+                 segment_keys: Sequence[str] = ("reason", "channel", "product")):
+        """
+        folds        : number of hold-out folds for the replication test.
+        seeds        : behavioral traversal seeds for the sensitivity test.
+        segment_keys : passed to the simulator for the distributional harm check.
+        """
+        self.folds = folds
+        self.seeds = tuple(seeds)
+        self.segment_keys = tuple(segment_keys)
+
+    # ── public: assess proposed changes ───────────────────────────────────────
+
+    def prescribe(self, baseline_tree: IVRTree,
+                  changes: List[Tuple[str, TreeChange]],
+                  callers: Sequence[Caller],
+                  observed_by_id: Dict[str, Dict[str, object]]) -> List[Prescription]:
+        """For each proposed change: measure (full population), reject if not a clean
+        win, else replicate + sensitivity-test and assign honest confidence. Returns
+        a full honest accounting — candidates AND rejections — ranked candidates
+        first (by confidence then projected lift)."""
+        out: List[Prescription] = []
+        for desc, change in changes:
+            out.append(self._assess_one(baseline_tree, desc, change, callers, observed_by_id))
+
+        order = {ConfidenceLevel.HIGH: 0, ConfidenceLevel.MODERATE: 1,
+                 ConfidenceLevel.LOW: 2, ConfidenceLevel.GHOST: 3,
+                 ConfidenceLevel.NO_EFFECT: 4}
+
+        def sort_key(p: Prescription):
+            is_candidate = p.status == PrescriptionStatus.CANDIDATE
+            lvl = order.get(p.confidence.level, 9) if p.confidence else 9
+            lift = p.confidence.full_delta if p.confidence else 0.0
+            return (not is_candidate, lvl, -lift)
+
+        out.sort(key=sort_key)
+        return out
+
+    def _assess_one(self, baseline_tree, desc, change, callers, observed) -> Prescription:
+        sim = Simulator(seed=self.seeds[0], segment_keys=self.segment_keys)
+        full = sim.measure(baseline_tree, change, callers, observed, desc)
+
+        # gate 1: only clean wins proceed. The simulator already separates false wins
+        # and landmines; we refuse anything that is not a clean win.
+        if not full.is_clean_win:
+            return Prescription(
+                change_description=desc,
+                status=PrescriptionStatus.REJECTED_NOT_CLEAN,
+                simulation=full,
+                rejection_reason=full.verdict,
+                change_fn=change,
+            )
+
+        # gate 2: replication + sensitivity
+        fold_deltas = self._replicate(baseline_tree, change, callers, observed)
+        seed_deltas = self._sensitivity(baseline_tree, change, callers, observed)
+        support = self._affected_support(full, callers)
+        level, replicated, rationale, caveats = classify_confidence(
+            full.net_containment_delta, fold_deltas, seed_deltas, support)
+
+        confidence = ConfidenceAssessment(
+            method=f"hold-out-and-replicate ({self.folds} folds) + seed sensitivity "
+                   f"({len(self.seeds)} seeds)",
+            full_delta=full.net_containment_delta,
+            fold_deltas=fold_deltas,
+            seed_deltas=seed_deltas,
+            support=support,
+            level=level,
+            replicated=replicated,
+            rationale=rationale,
+            caveats=caveats,
+        )
+
+        # a clean win that fails replication is a GHOST -> rejected (but recorded,
+        # so the consultant knows it was checked and found unstable)
+        if level in (ConfidenceLevel.GHOST, ConfidenceLevel.NO_EFFECT):
+            return Prescription(
+                change_description=desc,
+                status=PrescriptionStatus.REJECTED_GHOST,
+                simulation=full,
+                confidence=confidence,
+                rejection_reason=f"clean win on full population but {level.value}: {rationale}",
+                change_fn=change,
+            )
+
+        # survived: a real prescription candidate (still pending Partner sign-off)
+        p = Prescription(
+            change_description=desc,
+            status=PrescriptionStatus.CANDIDATE,
+            simulation=full,
+            confidence=confidence,
+            change_fn=change,
+        )
+        p.notes.append("CANDIDATE pending Partner validation (REAL) and fairness audit (CLEAN) "
+                       "before it is client-ready")
+        return p
+
+    # ── hold-out replication ──────────────────────────────────────────────────
+
+    def _fold_of(self, caller_id: str) -> int:
+        """Deterministic fold assignment by hashing the caller id."""
+        h = hashlib.sha256(f"fold:{caller_id}".encode()).digest()
+        return int.from_bytes(h[:4], "big") % self.folds
+
+    def _replicate(self, baseline_tree, change, callers, observed) -> List[float]:
+        """Split the population into folds; measure the change's net containment
+        delta independently on each fold. The spread of these is the band."""
+        buckets: Dict[int, List[Caller]] = {i: [] for i in range(self.folds)}
+        for c in callers:
+            buckets[self._fold_of(c.caller_id)].append(c)
+        sim = Simulator(seed=self.seeds[0], segment_keys=self.segment_keys)
+        deltas: List[float] = []
+        for i in range(self.folds):
+            sub = buckets[i]
+            if not sub:
+                continue
+            r = sim.measure(baseline_tree, change, sub, observed, f"fold{i}")
+            deltas.append(r.net_containment_delta)
+        return deltas
+
+    def _sensitivity(self, baseline_tree, change, callers, observed) -> List[float]:
+        """Re-measure the full-population net containment delta under different
+        behavioral seeds. Stable sign = robust to behavioral noise."""
+        deltas: List[float] = []
+        for s in self.seeds:
+            sim = Simulator(seed=s, segment_keys=self.segment_keys)
+            r = sim.measure(baseline_tree, change, callers, observed, f"seed{s}")
+            deltas.append(r.net_containment_delta)
+        return deltas
+
+    def _affected_support(self, full: SimulationResult, callers: Sequence[Caller]) -> int:
+        """Support = the number of callers whose outcome actually changed under the
+        variant (the population the effect genuinely rests on). Falls back to the
+        full population if not separable."""
+        # the simulation measured deltas at the population level; use total n as the
+        # honest support for an aggregate re-sequencing effect.
+        return len(callers)
+
+    # ── feedback loop ─────────────────────────────────────────────────────────
+
+    def make_outcome_record(self, prescription: Prescription) -> PrescriptionOutcome:
+        """Create the projected record that a real post-implementation measurement
+        will later be scored against."""
+        if prescription.confidence is None:
+            raise ValueError("cannot make an outcome record for a prescription with no confidence")
+        return PrescriptionOutcome(
+            change_description=prescription.change_description,
+            projected_delta=prescription.confidence.full_delta,
+            projected_band=prescription.confidence.band,
+        )

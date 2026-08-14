@@ -1,0 +1,46 @@
+"""
+Heuristic Rules Adapter
+=======================
+
+Baseline risk assessment using evidence-based clinical rules.
+Fastest engine, always runs, serves as sanity check.
+"""
+
+from datetime import datetime, timezone
+from observe_engine import RiskOutput
+from clinical_policy import ClinicalRules, RegimeClassifier
+
+
+def heuristic_rules_adapter(vitals) -> RiskOutput:
+    """
+    Evaluate vitals using heuristic clinical rules.
+
+    Args:
+        vitals: VitalsSnapshot
+
+    Returns:
+        RiskOutput with risk_score from rule violations
+    """
+    # Run all heuristic rules
+    risk_score, triggered_rules = ClinicalRules.all_rules(
+        hr=vitals.heart_rate,
+        o2_sat=vitals.oxygen_saturation,
+        rr=vitals.respiratory_rate,
+        temp=vitals.temperature,
+        age_months=vitals.context.get("age_months", 36),
+        previous_o2=vitals.context.get("previous_o2"),
+        previous_hr=vitals.context.get("previous_hr"),
+    )
+
+    # Classify regime
+    regime = RegimeClassifier.classify(risk_score)
+    regime_probs = RegimeClassifier.regime_probabilities(risk_score)
+
+    return RiskOutput(
+        engine_name="heuristic_rules",
+        risk_score=risk_score,
+        confidence=0.85 if triggered_rules else 0.95,  # Higher confidence if no rules triggered
+        regime_classification=regime_probs,
+        triggered_rules=triggered_rules,
+        timestamp=datetime.now(timezone.utc),
+    )

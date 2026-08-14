@@ -1,0 +1,183 @@
+Here is the extracted text from the presentation slides, organized by slide:
+## Slide 1: Tranche Overview
+**Tranche Overview — 8 Tranches, 1.9M Borrowers**
+8 Tranches | 1,895,539 Borrowers | Bi-Weekly Cadence | Jul 1, 2026 → Jan 5, 2027
+| Tranche | Grand Total | Avg Balance | Avg MPA | Avg Amort. | Avg Age | 
+| Avg Repay Yrs | Start Date | End Date |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 258,388 | $53,331 | $139 | 105% | 39.9 | 8.6 | 07/01/26 | 09/29/26 
+| |
+| 2 | 255,423 | $53,706 | $77 | 105% | 41 | 8.7 | 07/15/26 | 10/13/26 |
+| 3 | 253,659 | $46,788 | $74 | 102% | 37.8 | 8.5 | 07/29/26 | 10/27/26 
+| |
+| 4 | 258,937 | $43,088 | $65 | 102% | 37.3 | 8.6 | 08/12/26 | 11/10/26 
+| |
+| 5 | 257,387 | $41,521 | $54 | 103% | 37.6 | 8.5 | 08/26/26 | 11/24/26 
+| |
+| 6 | 257,605 | $45,722 | $69 | 104% | 39.5 | 9.2 | 09/09/26 | 12/08/26 
+| |
+| 7 | 258,804 | $47,738 | $76 | 105% | 40.6 | 9.9 | 09/23/26 | 12/22/26 
+| |
+| 8 | 95,336 | $34,363 | $710 | 103% | 41.2 | 11 | 10/07/26 | 01/05/27 | 
+| **Grand Total** | **1,895,539** | | | | | | | |
+**Key Facts**
+* **1.9M** Total borrowers impacted
+* **8 Tranches** — Biweekly Cadence
+* **90 day** Plan selection window
+* **6 month** — Total Transition Time
+* Start Date driven by **IDR Anniversary Date** (first in, first out)
+* **T1** pending apps | **T8** alternative plans
+*Footer: CONFIDENTIAL — Internal Use Only | Tranche Overview | May 2026 | Slide 3* ## Slide 2: Tranche Journey Timeline **Tranche Journey Timeline** **Tranche journey timeline (full 505-day arc)** 1.9M borrowers | 8 tranches | Each bar shows full borrower journey: Plan Selection → Billing Setup → Early Delinquency → Severe Delinquency **Timeline Shading Overlay Labels:**
+* PEAK SELECTION WINDOW
+* CREDIT REPORTING CASCADE
+* DEFAULT CASCADE
+**Tranche Populations:**
+* T1: 258K
+* T2: 255K
+* T3: 254K
+* T4: 259K
+* T5: 257K
+* T6: 258K
+* T7: 259K
+* T8: 95K
+**Phase shading (within each tranche)**
+* Plan Selection (Day 0-90)
+* Billing Setup (Day 90-145)
+* Early Delinquency (Day 145-235)
+* Severe Delinquency (Day 235-505)
+**Milestones**
+* Day 0 — Notice
+* Day 90 — Window close
+* Day 145 — 1st payment
+* Day 235 — Credit report
+* Day 505 — Default
+*Footer: CONFIDENTIAL — Internal Use Only | Tranche Journey Timeline | May 2026* ## Slide 3: Risk Mitigation & Transition Strategy **Risk Mitigation & Transition Strategy**
+* **Risk Items, Strategic Levers, & Next Steps** **Risk Items** **Operational Risks:**
+* Variance in Borrower Response Rate (Low – 7%, High 10%)
+* Variance in IDR apps/Backlog – Automation
+* Payment Shock – 3x-7x payment increase
+* Auto Debit (303K) - post 90 days, draft payments from accounts without borrower engagement
+* SLA miss/Disincentives
+* Less deflection/automation performance
+* Due Date Compression – 25.44% on 4 Due Dates (1: 26-28)
+* Repayment Calculator Availability (June 28) - limits pre-work
+* Credit Reporting Impact – average score impact (57 points)
+* Delinquency & Default Bubble downstream
+* Bad Addresses/Return Mail (Greenville) **Technology Risks:**
+* Pinpoint to Amazon Connect (mid-September)
+* WFM system (Oct-November)
+* MIVA to MVA (delayed to early 2027)
+* New code for repayment options (Fiserv/PAC's) necessitated by OB3 CR's - go live 6/28 **Portfolio / Transition Risks:**
+* Onboarding/Offboarding - PSLF (200-300K - August) **Additional Levers / Strategy**
+* AHT improvement
+* Improve IVR Deflection
+* Improve Shrinkage
+* Improve call resolution
+* PAC Automation Rate
+* UPH Improvement
+* Targeted call flow SAVE (tied to AHT improvement)
+* Auto Email reply for SAVE Keywords (Fiserv)
+* Chatbot/Chat Enhancement for SAVE (Fiserv) T3 vs. OCDIO solution
+* IDP Encore enhancements (Fiserv) (additional use case)
+* SLA Waiver
+**Strategy/Next Steps:**
+* Strategy Discussions
+* Communications
+* Deflection Opportunities
+**THE OPTIMAL BORROWER PATH**
+**Step 1.** Visit studentaid.gov/repayment-calculator — see your current repayment plan & MPA — compare every available plan against your actual income & family size **Step 2.** Apply for the best-fit plan directly through studentaid.gov — before your 90-day window closes *Basis of Transition Strategy – Subject lines, message bodies, voice scripts & IVR flows direct borrowers to this sequence. Fully automated process with highest success rate for Back Office.*
+*Footer: CONFIDENTIAL — Internal Use Only | Risk Mitigation & Transition Strategy | May 2026 | Slide 7* ## Slide 4: Portfolio Attributes **Portfolio Attributes — SAVE Transition Population**
+* **Cross Section of 20 Attributes | 1,895,539 Borrowers | High Disengagement/High Risk Population** **Repayment Profile**
+* **64%** in a $0 repayment (total portfolio at 53%)
+* **59%** – $0 MPA + Statement
+* **178K** > $200 MPA w/o autopay (Payment shock)
+* **23%** Proprietary | Graduated 30%, Withdrawn 34% **Negative Amortization Risk**
+* **49.4%** amortization >100% – balances growing
+* **6.6%** at >110% – aggressive balance growth **Billing & Autopay**
+* **Autopay: 16% (303K)** | **Statement: 84% (1.6M)**
+**Disengagement**
+* **66%** never called | **90%** no call in 5yrs+
+* **23%** logged in last 3mo | **57%** no login in 5yrs+ **Email Reachability Gap**
+* **88%** full email permission (1.66M reachable)
+* **Yet 57%** inactive 5yrs+ – channel exists, behavior doesn't **Payment History (Last Paid)**
+* **49%** never made a payment (923K borrowers)
+* **64%** dormant – no payment since before 2023
+* **Only 12.7%** recently active (paid 2025–2026)
+* **19%** paid in 2024 (359K) – SAVE on-ramp cohort **Last Paid Distribution (Chart Labels)**
+* Never Paid: 48.9%
+* Before 2023: 15.2%
+* 2023: 4.1%
+* 2024: 19%
+* 2025: 4%
+* 2026: 8.7%
+**BORROWER ENGAGEMENT HEATMAP — BY TRANCHE** *(% of each tranche by metric | Darker = more concerning)*
+| Metric | T1 | T2 | T3 | T4 | T5 | T6 | T7 | T8 |
+|---|---|---|---|---|---|---|---|---|
+| **NEVER logged in** | 23.5% | 27.6% | 16.3% | 16.8% | 21.0% | 21.9% | 
+| 22.2% | 29.8% | **NEVER called in** | 60.6% | 65.1% | 69.6% | 72.6% | 
+| 70.8% | 65.7% | 62.9% | 56.2% | **No valid email** | 4.5% | 5.1% | 
+| 3.3% | 3.3% | 4.0% | 4.5% | 4.8% | 5.7% |
+| **$0 current MPA** | 60.9% | 72.0% | 63.8% | 66.1% | 70.7% | 68.9% | 
+| 68.1% | 0.0% | **In negative amort** | 52.6% | 55.9% | 42.7% | 42.3% | 
+| 43.2% | 49.7% | 55.5% | 58.8% | **Autopay adoption** | 14.1% | 11.9% | 
+| 22.1% | 20.5% | 16.0% | 13.9% | 13.0% | 18.1% | **NEVER paid** | 52.1% 
+| | 57.4% | 44.3% | 45.2% | 49.1% | 49.0% | 48.7% | 41.4% | **Logged in 
+| <1 mo** | 13.9% | 11.7% | 19.8% | 16.5% | 13.0% | 12.6% | 11.6% | 
+| 17.8% | **Paid in 2026** | 8.7% | 5.3% | 10.1% | 8.4% | 6.4% | 6.3% | 
+| 5.6% | 33.6% | **Proprietary school** | 22.2% | 23.2% | 19.1% | 20.9% 
+| | 21.7% | 22.6% | 25.5% | 29.1% | **Withdrawn (no degree)** | 31.4% | 
+| 30.0% | 31.9% | 35.3% | 37.1% | 34.7% | 35.5% | 37.4% | **Long repay 
+| tail (>10y)** | 37.9% | 38.0% | 30.0% | 31.3% | 31.5% | 41.9% | 46.7% 
+| | 47.7% |
+*Footer: CONFIDENTIAL — Internal Use Only | Portfolio Attributes - SAVE Transition Population | May 2026 | Slide 6* ## Slide 5: Borrower Journey Timeline **Borrower Journey Timeline** **SAVE Transition — Borrower Journey Timeline** From 90 Day Deadline Notice through Default Placement | Approximate days from initial notification **Timeline Callouts:**
+* **90 Day Deadline Notice:** Forbearance ending notification issued
+* **1st Statement:** First billing statement (~30 days after move)
+* **Credit Reporting:** 90 days past due reported to credit bureaus
+* **Move to New Plan Notice:** Tiered Standard or Standard Level placement
+* **1st Payment Due:** First payment required (~21 days after statement)
+* **Default**
+**Timeline Markers & Phases:**
+* **Day 0**
+* *PLAN SELECTION WINDOW (90 DAYS)*
+* **Day 90**
+* *BILLING SETUP*
+* **Day 120**
+* **Day 145**
+* *EARLY DELINQUENCY (0-90 DAYS PAST DUE)*
+* **Day 235**
+* *SEVERE DELINQUENCY (91-360 DAYS PAST DUE)*
+* **Day 505**
+**Milestone Reference**
+| Day | Milestone | Type | Description |
+|---|---|---|---|
+| **Day 0** | **90 Day Deadline Notice** | Borrower Notice | 
+| Notification issued to borrower that SAVE forbearance is ending and 
+| 90-day plan-selection window has opened. | **Days 0-90** | **Plan 
+| Selection Window** | Transition Period | CR 7495 90-day window. 
+| Borrower must select a new repayment plan via the Repayment Calculator 
+| at studentaid.gov, or be moved to a default plan. | **Day 90** | 
+| **Move to New Plan Notice** | Servicer / System | If borrower has not 
+| selected a plan: ED places borrower in Tiered Standard or Standard 
+| Level. Notification issued, Tiered Standard is NOT PSLF-eligible. | 
+| **~Day 120** | **1st Statement** | Servicer Notice | First billing 
+| statement issued. Approximately 30 days after plan placement to allow 
+| billing-cycle setup. Statement-to-due-date interval is ~21 days 
+| minimum per federal regulation. | **~Day 145** | **1st Payment Due** | 
+| Borrower Obligation | First post-transition payment due. Borrowers 
+| without autopay must take active payment action. Missed payment starts 
+| the delinquency clock. | **~Day 235** | **Credit Reporting** | Adverse 
+| Reporting | 90 days past due. Delinquency reported to credit bureaus. 
+| First adverse credit event for non-paying borrowers. | **~Day 505** | 
+| **Default** | Terminal Outcome | 360 days past due. Loan transferred 
+| to default servicer. Wage garnishment, tax refund offset, and 
+| longer-term credit consequences become available collection 
+| mechanisms. |
+**Legend:**
+* Borrower Notice
+* Servicer / System Action
+* Borrower Obligation
+* Adverse Reporting
+* Terminal Outcome
+*Footer: CONFIDENTIAL — Internal Use Only | Borrower Journey Timeline | May 2026*
+
+Sent from my iPhone

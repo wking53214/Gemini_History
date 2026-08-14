@@ -1,0 +1,57 @@
+"""
+Provisional Store
+=================
+
+Manages provisional verdicts that are returned immediately
+while heavy engine jobs run in the background.
+"""
+
+from datetime import datetime, timezone
+from typing import Dict, Optional
+
+
+class ProvisionalStore:
+    """Stores provisional verdicts for fast initial response."""
+
+    def __init__(self):
+        self.provisionals: Dict[str, Dict] = {}
+
+    def store_provisional(
+        self,
+        patient_id: str,
+        job_id: str,
+        risk_score: float,
+        confidence: float,
+        regime: str,
+    ) -> None:
+        """Store provisional verdict (to be reconciled later)."""
+        self.provisionals[patient_id] = {
+            "job_id": job_id,
+            "risk_score": risk_score,
+            "confidence": confidence,
+            "regime": regime,
+            "is_provisional": True,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def get_provisional(self, patient_id: str) -> Optional[Dict]:
+        """Retrieve provisional verdict if exists."""
+        return self.provisionals.get(patient_id)
+
+    def reconcile(self, patient_id: str, final_result: Dict) -> None:
+        """Replace provisional with final result from heavy job."""
+        if patient_id in self.provisionals:
+            self.provisionals[patient_id].update({
+                "is_provisional": False,
+                "final_result": final_result,
+                "reconciled_at": datetime.now(timezone.utc).isoformat(),
+            })
+
+    def export_all(self) -> Dict[str, Dict]:
+        """Export all provisional store for audit."""
+        return self.provisionals.copy()
+
+    def clear_patient(self, patient_id: str) -> None:
+        """Clear provisional verdict for patient (after reconciliation)."""
+        if patient_id in self.provisionals:
+            del self.provisionals[patient_id]

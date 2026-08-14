@@ -1,0 +1,155 @@
+"""
+reference_tree.py — A sample IVR tree with deliberately known properties, plus
+the harness runner that generates a full journey dataset from a population.
+
+The reference tree is built to CONTAIN a known anti-pattern so the system has
+something real to find: the entry menu leads with the AGENT option (the classic
+containment-killing sequence), and the self-serve nodes have a real route-intent-
+vs-outcome gap (resolve_prob < 1). A later re-sequencing — pushing AGENT to the
+end and leading with the high-frequency self-serve options — should measurably
+lift containment on the SAME population. That is the end-to-end proof the harness
+exists to make possible.
+"""
+
+from __future__ import annotations
+
+from typing import Dict, List
+
+from ivr_tree import IVRTree, Node, NodeKind, Option
+from caller_model import Caller, PopulationGenerator, PopulationConfig
+from traversal import TraversalEngine, Journey, BehaviorParams
+
+
+def build_reference_tree() -> IVRTree:
+    """A small but realistic tree. ENTRY leads with 'agent' on purpose (the
+    anti-pattern). Self-serve nodes carry a real fake-containment gap."""
+    nodes: Dict[str, Node] = {}
+
+    # Entry menu — note AGENT option is FIRST (the anti-pattern to be fixed).
+    nodes["entry"] = Node(
+        node_id="entry", kind=NodeKind.MENU, prompt="Main menu",
+        options=[
+            Option("Speak to an agent", "agent", intent_tag="agent"),
+            Option("Report fraud", "fraud_auth", intent_tag="fraud"),
+            Option("Account balance", "balance", intent_tag="balance"),
+            Option("Make a payment", "payment", intent_tag="payment"),
+            Option("Dispute a charge", "dispute_menu", intent_tag="dispute"),
+            Option("Technical support", "tech", intent_tag="tech_support"),
+            Option("Other", "other_menu", intent_tag=None),
+        ])
+
+    # Balance: mostly resolves in self-serve, small fake-containment gap.
+    nodes["balance"] = Node(
+        node_id="balance", kind=NodeKind.SELF_SERVE, prompt="Your balance is...",
+        resolve_prob=0.90, next_on_fail="agent")
+
+    # Payment: needs a data dip (can be slow), then self-serve that sometimes fails.
+    nodes["payment"] = Node(
+        node_id="payment", kind=NodeKind.DATA_DIP, prompt="Looking up your account",
+        fail_prob=0.05, slow_prob=0.20, next_id="payment_action")
+    nodes["payment_action"] = Node(
+        node_id="payment_action", kind=NodeKind.SELF_SERVE, prompt="Process payment",
+        resolve_prob=0.80, next_on_fail="agent")
+
+    # Fraud: auth-gated, then straight to a human (fraud usually needs a person).
+    nodes["fraud_auth"] = Node(
+        node_id="fraud_auth", kind=NodeKind.AUTH, prompt="Verify identity",
+        success_prob=0.75, max_attempts=3, next_on_success="agent")
+
+    # Dispute: a sub-menu, then a self-serve that fails fairly often (real gap).
+    nodes["dispute_menu"] = Node(
+        node_id="dispute_menu", kind=NodeKind.MENU, prompt="Dispute menu",
+        options=[
+            Option("Dispute a transaction", "dispute_action", intent_tag="dispute"),
+            Option("Speak to an agent", "agent", intent_tag="agent"),
+        ])
+    nodes["dispute_action"] = Node(
+        node_id="dispute_action", kind=NodeKind.SELF_SERVE, prompt="File dispute",
+        resolve_prob=0.55, next_on_fail="agent")   # notable fake-containment gap
+
+    # Tech support: self-serve that often doesn't resolve. Crucially, on failure
+    # it routes to a "confirmation" node that does NOT offer an agent — the caller
+    # is told the issue is handled and the call ends. This is REAL fake containment:
+    # they leave automation "handled" but unresolved, and will likely call back.
+    nodes["tech"] = Node(
+        node_id="tech", kind=NodeKind.SELF_SERVE, prompt="Troubleshooting",
+        resolve_prob=0.50, next_on_fail="tech_confirm")
+    nodes["tech_confirm"] = Node(
+        node_id="tech_confirm", kind=NodeKind.SELF_SERVE, prompt="We've reset your service. Goodbye.",
+        resolve_prob=0.0, next_on_fail=None)   # terminal, never resolves -> CONTAINED_UNRESOLVED
+
+    # Other: a catch-all menu that mostly routes to agent (low containment by design).
+    nodes["other_menu"] = Node(
+        node_id="other_menu", kind=NodeKind.MENU, prompt="Other",
+        options=[
+            Option("Account changes", "account_change", intent_tag="account_change"),
+            Option("New service", "new_service", intent_tag="new_service"),
+            Option("Speak to an agent", "agent", intent_tag="agent"),
+        ])
+    nodes["account_change"] = Node(
+        node_id="account_change", kind=NodeKind.SELF_SERVE, prompt="Account change",
+        resolve_prob=0.65, next_on_fail="agent")
+    nodes["new_service"] = Node(
+        node_id="new_service", kind=NodeKind.SELF_SERVE, prompt="New service info",
+        resolve_prob=0.45, next_on_fail="new_service_info")
+    nodes["new_service_info"] = Node(
+        node_id="new_service_info", kind=NodeKind.SELF_SERVE,
+        prompt="We've sent you the info. Goodbye.",
+        resolve_prob=0.0, next_on_fail=None)   # terminal fake-containment dead-end
+
+    # Terminal: the live agent (containment failure).
+    nodes["agent"] = Node(node_id="agent", kind=NodeKind.AGENT, prompt="Connecting you to an agent")
+
+    return IVRTree(entry_id="entry", nodes=nodes, name="reference")
+
+
+def run_harness(callers: List[Caller], tree: IVRTree,
+                params: BehaviorParams = None, seed: int = 7) -> List[Journey]:
+    """Run an entire population through a tree, returning their journeys."""
+    engine = TraversalEngine(params=params, seed=seed)
+    return [engine.run(c, tree) for c in callers]
+
+
+def containment_rate(journeys: List[Journey]) -> float:
+    if not journeys:
+        return 0.0
+    return sum(1 for j in journeys if j.contained) / len(journeys)
+
+
+def true_resolution_rate(journeys: List[Journey]) -> float:
+    if not journeys:
+        return 0.0
+    return sum(1 for j in journeys if j.truly_resolved) / len(journeys)
+
+
+def fake_containment_rate(journeys: List[Journey]) -> float:
+    """Share of ALL journeys that were 'contained' but NOT actually resolved."""
+    if not journeys:
+        return 0.0
+    from ivr_tree import Outcome
+    return sum(1 for j in journeys if j.outcome is Outcome.CONTAINED_UNRESOLVED) / len(journeys)
+
+
+if __name__ == "__main__":
+    # Smoke demonstration: build a population, run the reference tree, then run a
+    # re-sequenced tree (agent pushed last) on the SAME population, and compare.
+    pop = PopulationGenerator(PopulationConfig(n=5000, seed=11)).generate()
+    tree = build_reference_tree()
+
+    base = run_harness(pop, tree, seed=11)
+    print("=== Reference tree (agent option FIRST — the anti-pattern) ===")
+    print(f"  containment:       {containment_rate(base):.1%}")
+    print(f"  true resolution:   {true_resolution_rate(base):.1%}")
+    print(f"  fake containment:  {fake_containment_rate(base):.1%}")
+
+    # Intervention: push the agent option to the end of the entry menu.
+    fixed = tree.move_option_to_end("entry", "agent")
+    after = run_harness(pop, fixed, seed=11)
+    print("\n=== Re-sequenced (agent option pushed LAST) ===")
+    print(f"  containment:       {containment_rate(after):.1%}")
+    print(f"  true resolution:   {true_resolution_rate(after):.1%}")
+    print(f"  fake containment:  {fake_containment_rate(after):.1%}")
+
+    print(f"\nContainment delta from re-sequencing: "
+          f"{(containment_rate(after) - containment_rate(base))*100:+.1f} points "
+          f"(same population, same seed — difference is structural)")

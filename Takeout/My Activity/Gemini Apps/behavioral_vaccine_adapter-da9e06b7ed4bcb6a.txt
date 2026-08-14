@@ -1,0 +1,115 @@
+"""
+Behavioral Vaccine Adapter
+===========================
+
+Pattern-based risk assessment.
+Learns benign vs dangerous patterns from experience.
+Reduces false alarms from benign fevers, crying, etc.
+"""
+
+from datetime import datetime, timezone
+from observe_engine import RiskOutput
+from clinical_policy import BehavioralVaccine
+
+
+def behavioral_vaccine_adapter(vitals) -> RiskOutput:
+    """
+    Pattern-based risk assessment using learned behaviors.
+
+    Args:
+        vitals: VitalsSnapshot (with pattern context)
+
+    Returns:
+        RiskOutput with pattern-adjusted risk_score
+    """
+
+    triggered_rules = []
+    base_risk_score = vitals.context.get("base_risk_score", 0.3)
+
+    # Detect benign patterns
+    pattern_identified = None
+    risk_adjustment = 0.0
+
+    # Pattern 1: Fever response (common, usually benign)
+    if (
+        vitals.temperature > 38.5 and
+        vitals.heart_rate > 100 and
+        vitals.oxygen_saturation > 94 and
+        vitals.context.get("alert", True)
+    ):
+        pattern_identified = "fever_response"
+        risk_adjustment = -0.2
+        triggered_rules.append(
+            "PATTERN: Fever response (elevated temp + HR, normal O2, alert) - "
+            "common and usually benign"
+        )
+
+    # Pattern 2: Crying baby (transient tachycardia)
+    elif (
+        vitals.heart_rate > 140 and
+        vitals.respiratory_rate > 35 and
+        vitals.oxygen_saturation > 95 and
+        vitals.context.get("duration_seconds", 0) < 120
+    ):
+        pattern_identified = "crying_baby"
+        risk_adjustment = -0.3
+        triggered_rules.append(
+            "PATTERN: Crying or distress (isolated tachycardia + tachypnea, "
+            "short duration, normal O2) - transient, self-limiting"
+        )
+
+    # Detect dangerous patterns
+    elif (
+        vitals.oxygen_saturation < 90 and
+        vitals.heart_rate > 150 and
+        vitals.context.get("perfusion_quality", "normal") == "poor"
+    ):
+        pattern_identified = "septic_shock"
+        risk_adjustment = 0.5
+        triggered_rules.append(
+            "PATTERN: Septic shock (low O2 + high HR + poor perfusion) - "
+            "CRITICAL, requires immediate escalation"
+        )
+
+    elif (
+        vitals.respiratory_rate > 60 and
+        vitals.oxygen_saturation < 88 and
+        vitals.context.get("retractions", False)
+    ):
+        pattern_identified = "respiratory_distress"
+        risk_adjustment = 0.4
+        triggered_rules.append(
+            "PATTERN: Respiratory distress (very high RR + low O2 + retractions) - "
+            "CRITICAL respiratory deterioration"
+        )
+
+    # Apply adjustment to base risk
+    adjusted_risk_score = max(0.0, min(1.0, base_risk_score + risk_adjustment))
+
+    if not pattern_identified:
+        triggered_rules.append("No distinctive pattern recognized")
+        confidence = 0.4
+    else:
+        confidence = 0.8
+
+    # Regime classification
+    regime_probs = {
+        "stable": max(0, 1.0 - adjusted_risk_score),
+        "caution": min(0.5, adjusted_risk_score * 0.4),
+        "warning": min(0.3, adjusted_risk_score * 0.5),
+        "critical": min(0.2, adjusted_risk_score * 0.7) if adjusted_risk_score > 0.5 else 0.0,
+    }
+
+    # Normalize
+    total = sum(regime_probs.values())
+    if total > 0:
+        regime_probs = {k: v / total for k, v in regime_probs.items()}
+
+    return RiskOutput(
+        engine_name="behavioral_vaccine",
+        risk_score=adjusted_risk_score,
+        confidence=confidence,
+        regime_classification=regime_probs,
+        triggered_rules=triggered_rules,
+        timestamp=datetime.now(timezone.utc),
+    )

@@ -1,0 +1,205 @@
+"""
+test_simulator.py — Locks the honest-measurement simulator.
+
+The tests prove the simulator's reason for existing: it does not just report a net
+number, it catches the changes that look good and are not.
+
+  CONTROLLED COMPARISON — same population/seed; a no-op change yields zero effect;
+    the baseline is never mutated.
+  HONEST VERDICTS — a clean win is called clean; a change that raises containment
+    by raising FAKE containment is called a FALSE WIN; a change that harms a
+    segment while gaining net is called a LANDMINE.
+  DISTRIBUTION IS FIRST-CLASS — per-segment effects are computed; harm is surfaced
+    at the top level; a net gain with a harmed segment is NOT a clean win.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from reference_tree import build_reference_tree
+from caller_model import PopulationGenerator, PopulationConfig
+from ivr_tree import Node, NodeKind, Option
+from simulator import Simulator, push_option_last, lead_with, reorder_menu
+from simulation_types import SEGMENT_HARM_THRESHOLD
+
+
+def _setup(n=12000, seed=11):
+    pop = PopulationGenerator(PopulationConfig(n=n, seed=seed)).generate()
+    observed = {c.caller_id: c.observed() for c in pop}
+    return build_reference_tree(), pop, observed, Simulator(seed=seed)
+
+
+# ── CONTROLLED COMPARISON ─────────────────────────────────────────────────────
+
+def test_noop_change_yields_zero_effect():
+    """A change that doesn't actually change anything must measure as zero effect
+    (the entry menu already leads with 'agent', so leading with agent is a no-op)."""
+    tree, pop, observed, sim = _setup()
+    r = sim.measure(tree, lead_with("entry", "agent"), pop, observed, "no-op")
+    assert r.net_containment_delta == 0.0
+    assert not r.harmful_segments
+    print("PASS: no-op change yields zero effect")
+
+
+def test_change_does_not_mutate_baseline():
+    """Measuring a change must not mutate the baseline tree (the comparison relies
+    on the baseline staying fixed)."""
+    tree, pop, observed, sim = _setup()
+    before = [o.target_id for o in tree.node("entry").options]
+    sim.measure(tree, push_option_last("entry", "agent"), pop, observed)
+    after = [o.target_id for o in tree.node("entry").options]
+    assert before == after, "baseline tree was mutated by measurement"
+    print("PASS: measurement does not mutate the baseline tree")
+
+
+def test_change_returning_same_object_is_rejected():
+    """A 'change' that returns the same tree object (no clone) must be rejected —
+    it would mean an in-place mutation, breaking the controlled comparison."""
+    tree, pop, observed, sim = _setup(n=500)
+    def bad_change(t):
+        return t  # returns same object, no clone
+    with pytest.raises(ValueError):
+        sim.measure(tree, bad_change, pop, observed)
+    print("PASS: a change that doesn't clone is rejected")
+
+
+def test_determinism():
+    """Same change measured twice gives identical deltas (controlled & seeded)."""
+    tree, pop, observed, sim = _setup(n=4000)
+    ch = push_option_last("entry", "agent")
+    r1 = sim.measure(tree, ch, pop, observed)
+    r2 = sim.measure(tree, ch, pop, observed)
+    assert r1.net_containment_delta == r2.net_containment_delta
+    assert [s.containment_delta for s in r1.segment_effects] == \
+           [s.containment_delta for s in r2.segment_effects]
+    print("PASS: measurement is deterministic")
+
+
+# ── HONEST VERDICTS ───────────────────────────────────────────────────────────
+
+def test_clean_win_is_recognized():
+    """Pushing the agent option last lifts containment AND true resolution with no
+    harmed segment — a clean win."""
+    tree, pop, observed, sim = _setup()
+    r = sim.measure(tree, push_option_last("entry", "agent"), pop, observed, "push agent last")
+    assert r.net_containment_delta > 0
+    assert r.net_true_resolution_delta > 0
+    assert not r.harmful_segments
+    assert r.is_clean_win
+    assert "CLEAN WIN" in r.verdict
+    print(f"PASS: clean win recognized ({r.net_containment_delta*100:+.1f}pt, no harm)")
+
+
+def _trap_a_segment(tree):
+    """A change that raises overall containment by routing dispute failures to a
+    fake-containment dead-end (and removing their agent escape) — looks great on
+    the top line, actually traps callers unresolved."""
+    t = tree.clone()
+    t.nodes["dispute_deadend"] = Node("dispute_deadend", NodeKind.SELF_SERVE,
+        prompt="We have filed your dispute. Goodbye.", resolve_prob=0.0, next_on_fail=None)
+    t.node("dispute_action").next_on_fail = "dispute_deadend"
+    n = t.node("dispute_menu")
+    n.options = [o for o in n.options if o.target_id != "agent"]
+    return t
+
+
+def test_false_win_is_caught():
+    """A change that raises containment LARGELY by raising FAKE containment must be
+    called a FALSE WIN, not an improvement — the most seductive bad change."""
+    tree, pop, observed, sim = _setup()
+    r = sim.measure(tree, _trap_a_segment, pop, observed, "reroute dispute to dead-end")
+    # containment goes UP but so does fake containment, materially
+    assert r.net_containment_delta > 0
+    assert r.net_fake_containment_delta > SEGMENT_HARM_THRESHOLD
+    assert "FALSE WIN" in r.verdict
+    assert not r.is_clean_win, "a fake-containment-driven gain must NOT be a clean win"
+    print(f"PASS: false win caught (containment {r.net_containment_delta*100:+.1f}pt but "
+          f"fake {r.net_fake_containment_delta*100:+.1f}pt)")
+
+
+def test_false_win_surfaces_harmed_segments():
+    """The false-win change must also surface harmed segments at the top level."""
+    tree, pop, observed, sim = _setup()
+    r = sim.measure(tree, _trap_a_segment, pop, observed)
+    assert r.harmful_segments, "harmed segments not surfaced"
+    assert r.worst_harm is not None
+    print(f"PASS: harmed segments surfaced ({len(r.harmful_segments)}; "
+          f"worst {r.worst_harm.label})")
+
+
+# ── DISTRIBUTION IS FIRST-CLASS ───────────────────────────────────────────────
+
+def test_segment_effects_are_computed():
+    """The per-segment breakdown must be populated for the configured cuts."""
+    tree, pop, observed, sim = _setup()
+    r = sim.measure(tree, push_option_last("entry", "agent"), pop, observed)
+    assert len(r.segment_effects) > 0
+    keys = {s.label.split("=")[0] for s in r.segment_effects}
+    assert "reason" in keys and "channel" in keys
+    print(f"PASS: per-segment effects computed across {len(keys)} attribute cuts")
+
+
+def test_net_gain_with_harm_is_not_clean_win():
+    """The core honesty property: a positive net containment delta with a harmed
+    segment is NOT a clean win."""
+    tree, pop, observed, sim = _setup()
+    r = sim.measure(tree, _trap_a_segment, pop, observed)
+    assert r.net_containment_delta > 0       # net looks good
+    assert r.harmful_segments                # but a segment is harmed
+    assert not r.is_clean_win                # therefore NOT a clean win
+    print("PASS: net gain + harmed segment is correctly NOT a clean win")
+
+
+def test_compare_ranks_clean_wins_above_landmines():
+    """When comparing changes, a clean win must rank above a higher-net landmine —
+    honesty in the ranking, not just the labels."""
+    tree, pop, observed, sim = _setup()
+    changes = [
+        ("push agent last (clean, smaller net)", push_option_last("entry", "agent")),
+        ("trap dispute (false win, bigger net)", _trap_a_segment),
+    ]
+    ranked = sim.compare(tree, changes, pop, observed)
+    # the clean win must come first even though the trap has a larger net delta
+    assert ranked[0].is_clean_win, "a non-clean change outranked a clean win"
+    assert not ranked[1].is_clean_win
+    # and confirm the trap really did have the larger raw net (so the test is meaningful)
+    trap = next(r for r in ranked if "trap" in r.change_description)
+    clean = next(r for r in ranked if "clean" in r.change_description)
+    assert trap.net_containment_delta > clean.net_containment_delta
+    print("PASS: compare ranks the clean win above the larger-net landmine")
+
+
+def test_no_improvement_verdict():
+    """A change that doesn't raise containment or resolution is called NO
+    IMPROVEMENT (a no-op qualifies)."""
+    tree, pop, observed, sim = _setup()
+    r = sim.measure(tree, lead_with("entry", "agent"), pop, observed)  # no-op
+    assert "NO IMPROVEMENT" in r.verdict
+    print("PASS: no-improvement verdict for a change that doesn't help")
+
+
+if __name__ == "__main__":
+    tests = [
+        test_noop_change_yields_zero_effect,
+        test_change_does_not_mutate_baseline,
+        test_change_returning_same_object_is_rejected,
+        test_determinism,
+        test_clean_win_is_recognized,
+        test_false_win_is_caught,
+        test_false_win_surfaces_harmed_segments,
+        test_segment_effects_are_computed,
+        test_net_gain_with_harm_is_not_clean_win,
+        test_compare_ranks_clean_wins_above_landmines,
+        test_no_improvement_verdict,
+    ]
+    print("=" * 70)
+    failures = 0
+    for t in tests:
+        try:
+            t()
+        except AssertionError as e:
+            failures += 1
+            print(f"FAIL: {t.__name__}: {e}")
+    print("=" * 70)
+    print(f"{'ALL ' + str(len(tests)) + ' SIMULATOR TESTS PASSED' if not failures else str(failures) + ' FAILED'}")

@@ -1,0 +1,81 @@
+
+SYNTHETIC FRAUD ARMY (DETECTION-ONLY)
+===================================
+
+Purpose:
+- Negative-control population to detect unintended effects of IVR changes on hostile automation.
+- Detection-only. Not used for optimization, blocking, or prescriptive changes.
+- Abstract intent classes only. No tactics, paths, or data fields are specified.
+
+Created: 2026-05-08T16:25:27.727827
+Total Entities: 2000
+
+Governance:
+- Excluded from learning/falsification under the Learning Exclusion Charter.
+- Used pre-change and post-change only to assess unintended exposure.
+- Outputs are classification labels: Neutral / Risk-Increasing / Regressive.
+
+
+INTENT ARCHETYPES
+-----------------
+
+A. Account State Confirmation (40%)
+- Abstract goal: Determine stability of read-only account state.
+- Signals observed: determinism, variance collapse, dwell-time stability.
+
+B. Identity Surface Mapping (20%)
+- Abstract goal: Infer response uniformity across identity confirmation attempts.
+- Signals observed: error uniformity, response structure consistency.
+
+C. Eligibility/Status Boundary Probing (15%)
+- Abstract goal: Discover threshold clarity between allowed/non-allowed states.
+- Signals observed: boundary sharpness, message predictability.
+
+D. Temporal Consistency Testing (15%)
+- Abstract goal: Compare response behavior across time windows.
+- Signals observed: time-of-day variance, maintenance window effects.
+
+E. Process Chaining Discovery (10%)
+- Abstract goal: Assess whether prior benign interactions reduce friction later.
+- Signals observed: state carryover, session memory leakage.
+
+
+ENTITY SCHEMA (ABSTRACT)
+------------------------
+Each synthetic entity includes:
+- Synthetic_ID (SF-00001 ... SF-02000)
+- Primary_Intent (A-E)
+- Secondary_Intent (A-E, activates post-change only)
+- Time_Window_Bias (Day / Evening / Overnight)
+- Path_Variance_Class (Low / Medium / High)
+- Retry_Cadence_Class (Low / Medium / High)
+- Escalation_Intent (Always False or Near-Zero)
+- Human_Likeness_Index (Low / Medium)
+
+Note: Values represent abstract behavioral profiles only.
+
+
+RUN PROTOCOL
+------------
+1. Baseline Run (Pre-Change)
+- Execute detection pass to establish neutral exposure profile.
+
+2. Post-Change Run (Post-Modification)
+- Execute identical pass to compare exposure shifts.
+
+Evaluation:
+- Identify any intent class with improved determinism, reduced variance, or faster convergence.
+- Classify overall impact as Neutral / Risk-Increasing / Regressive.
+
+Restrictions:
+- No IVR changes are driven by this population.
+- Findings are advisory gates prior to productionization.
+
+
+REPORTING OUTPUTS
+-----------------
+- Summary table by Intent Archetype
+- Delta indicators (Pre vs Post)
+- Executive annotation: 'No material exposure increase' or 'Exposure increase detected'
+
+This document is part of the IVR Optimization Governance Package.

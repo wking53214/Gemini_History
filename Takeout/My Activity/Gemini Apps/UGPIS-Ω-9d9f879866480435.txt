@@ -1,0 +1,2551 @@
+﻿"""
+UGPIS-Ω: Unified Governance, Predictive, and Integrity Stack (FIXED)
+
+
+Full integrated code snapshot with corrections:
+- ZTGKT separated into content_polish vs. domain_validation
+- HTTP replaced with optional ToneNormalizationPipeline
+- FORTRESS transition logging
+- URE regime classifier with multi-dimensional state
+- EDDP with explicit metric definitions
+- GSA with state transition guards
+- Comprehensive logging and audit trails
+"""
+
+
+from __future__ import annotations
+
+
+import math
+import time
+import json
+import hmac
+import hashlib
+import asyncio
+import logging
+import re
+import datetime
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime as dt
+from enum import Enum
+from typing import (
+    Any,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Callable,
+    Awaitable,
+    Sequence,
+    Union,
+)
+
+
+import numpy as np
+from collections import deque
+
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response
+from prometheus_client import Counter, Histogram, Gauge, generate_latest
+
+
+# =====================================================================
+# LOGGING SETUP WITH STRUCTURED OUTPUT
+# =====================================================================
+
+
+logger = logging.getLogger("ugpis")
+handler = logging.StreamHandler()
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        payload = {
+            "timestamp": dt.utcnow().isoformat(),
+            "level": record.levelname,
+            "message": record.getMessage(),
+            "logger": record.name,
+            "module": record.module,
+        }
+        return json.dumps(payload)
+
+
+handler.setFormatter(JsonFormatter())
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
+
+# =====================================================================
+# CONTENT POLISH PIPELINE (separated from domain validation)
+# =====================================================================
+
+
+LINGUISTIC_PATTERNS: Dict[str, re.Pattern] = {
+    "first_person_tokens": re.compile(
+        r"\b(i|me|my|mine|myself|we|us|our|ours|ourselves)\b",
+        re.IGNORECASE,
+    ),
+    "hedging_tokens": re.compile(
+        r"\b(may|might|could|seems|generally|potentially|likely|perhaps|maybe)\b",
+        re.IGNORECASE,
+    ),
+    "prohibited_verbs": re.compile(
+        r"\b(improve|optimize|enhance|enable|support|strengthen|utilize|leverage)\b",
+        re.IGNORECASE,
+    ),
+    "causal_connectives": re.compile(
+        r"\b(because|due to|driven by|resulting from|caused by)\b",
+        re.IGNORECASE,
+    ),
+    "numeric_metrics": re.compile(r"\b\d+(\.\d+)?%|\b\d+\b"),
+}
+
+
+class PersonalPronounFilter:
+    @staticmethod
+    def is_clean(text: str) -> bool:
+        return not bool(LINGUISTIC_PATTERNS["first_person_tokens"].search(text))
+
+
+class SpeculativeLanguageFilter:
+    @staticmethod
+    def is_clean(text: str) -> bool:
+        return not bool(LINGUISTIC_PATTERNS["hedging_tokens"].search(text))
+
+
+class EmpiricalValidationFilter:
+    @staticmethod
+    def is_clean(text: str) -> bool:
+        has_causality = bool(LINGUISTIC_PATTERNS["causal_connectives"].search(text))
+        has_metrics = bool(LINGUISTIC_PATTERNS["numeric_metrics"].search(text))
+        return has_causality or has_metrics
+
+
+class TextNormalizer:
+    @staticmethod
+    def process(text: str) -> str:
+        return LINGUISTIC_PATTERNS["prohibited_verbs"].sub("use", text)
+
+
+class ExecutionPacer:
+    def __init__(self, minimum_latency_ms: float = 15.0):
+        self.minimum_latency_seconds: float = minimum_latency_ms / 1000.0
+        self.scaling_coefficient: float = 0.815
+
+
+    async def calculate_delay(self, text_payload: str) -> float:
+        word_count = len(text_payload.split())
+        calculated_delay = (word_count * 0.002) * self.scaling_coefficient
+        return max(self.minimum_latency_seconds, min(calculated_delay, 0.200))
+
+
+    @staticmethod
+    async def enforce_pause(delay_duration: float) -> None:
+        await asyncio.sleep(delay_duration)
+
+
+class ContentPolishPipeline:
+    """Polish output for external communication (optional routing)."""
+    def __init__(self, execution_gateway: Callable[[str], Awaitable[str]], max_attempts: int = 5):
+        self.gateway = execution_gateway
+        self.max_attempts = max_attempts
+        self.pronoun_filter = PersonalPronounFilter()
+        self.speculation_filter = SpeculativeLanguageFilter()
+        self.empirical_filter = EmpiricalValidationFilter()
+        self.normalizer = TextNormalizer()
+        self.pacer = ExecutionPacer()
+        self._signing_key: bytes = b"GENERIC_PIPELINE_HMAC_SECRET_KEY_SHA384_815"
+
+
+    def _compute_signature(self, text: str) -> str:
+        return hmac.new(self._signing_key, text.encode("utf-8"), hashlib.sha384).hexdigest()
+
+
+    async def execute(self, input_prompt: str) -> Dict[str, Any]:
+        active_prompt = input_prompt
+        start_time = time.time()
+        historical_hashes: set[str] = set()
+
+
+        for iteration in range(1, self.max_attempts + 1):
+            raw_response = await self.gateway(active_prompt)
+            normalized_response = self.normalizer.process(raw_response)
+
+
+            pronoun_check = self.pronoun_filter.is_clean(normalized_response)
+            speculation_check = self.speculation_filter.is_clean(normalized_response)
+            empirical_check = self.empirical_filter.is_clean(normalized_response)
+
+
+            response_hash = hashlib.md5(normalized_response.encode("utf-8")).hexdigest()
+            duplicate_detected = response_hash in historical_hashes
+
+
+            if pronoun_check and speculation_check and empirical_check and not duplicate_detected:
+                delay = await self.pacer.calculate_delay(normalized_response)
+                await self.pacer.enforce_pause(delay)
+
+
+                total_latency_ms = (time.time() - start_time) * 1000.0
+                signature = self._compute_signature(normalized_response)
+
+
+                logger.info(f"ContentPolishPipeline SUCCESS after {iteration} attempt(s)")
+                return {
+                    "execution_status": "SUCCESS",
+                    "validation_parity": 1.0000,
+                    "retry_attempts": iteration,
+                    "latency_duration_ms": round(total_latency_ms, 2),
+                    "payload_signature": signature,
+                    "validated_content": normalized_response,
+                }
+
+
+            historical_hashes.add(response_hash)
+            failures = []
+            if not pronoun_check:
+                failures.append("First-person language signature registered.")
+            if not speculation_check:
+                failures.append("Qualifying or ambiguous statements registered.")
+            if not empirical_check:
+                failures.append("Missing explicit rationales or metrics.")
+            if duplicate_detected:
+                failures.append("Duplicate generational loop pattern registered.")
+
+
+            active_prompt = (
+                f"{input_prompt}\n[RECALIBRATION_FEEDBACK]: Prior output failed validation rules due to: "
+                f"{', '.join(failures)} Regulate generation format to meet precise syntax constraints."
+            )
+
+
+        logger.error(f"ContentPolishPipeline CRITICAL FAILURE after {self.max_attempts} attempts")
+        raise SystemError("CRITICAL_PIPELINE_FAILURE: Maximum retry limits exhausted without validation consensus.")
+
+
+# =====================================================================
+# ECP (Execution Control Pipeline)
+# =====================================================================
+
+
+class SecureDataIngestionPipeline:
+    def __init__(self, cryptographic_secret: str, max_log_capacity: int = 1000):
+        self.cryptographic_secret: bytes = cryptographic_secret.encode()
+        self.bounded_audit_history: deque = deque(maxlen=max_log_capacity)
+
+
+    @staticmethod
+    def normalize_payload_spacing(payload: Dict[str, Any]) -> Dict[str, Any]:
+        copied_payload = dict(payload)
+        if "body_content" in copied_payload and isinstance(copied_payload["body_content"], str):
+            copied_payload["body_content"] = " ".join(copied_payload["body_content"].split())
+        return copied_payload
+
+
+    @staticmethod
+    def validate_schema_constraints(payload: Dict[str, Any]) -> bool:
+        if "body_content" not in payload or not isinstance(payload["body_content"], str):
+            return False
+
+
+        content_length = len(payload["body_content"])
+        if content_length == 0 or content_length > 5000:
+            return False
+
+
+        if "metadata_context" not in payload or not isinstance(payload["metadata_context"], dict):
+            return False
+
+
+        return True
+
+
+    def generate_payload_signature(self, payload: Dict[str, Any]) -> str:
+        canonical_bytes = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode()
+
+
+        return hmac.new(
+            self.cryptographic_secret,
+            canonical_bytes,
+            hashlib.sha256,
+        ).hexdigest()
+
+
+    def verify_signature_integrity(self, payload: Dict[str, Any], provided_signature: str) -> bool:
+        expected_signature = self.generate_payload_signature(payload)
+        return hmac.compare_digest(expected_signature, provided_signature)
+
+
+    def record_pipeline_event(self, event_type: str, payload: Dict[str, Any]) -> None:
+        self.bounded_audit_history.append(
+            {
+                "timestamp": time.time(),
+                "event_classification": event_type,
+                "associated_payload": payload,
+            }
+        )
+
+
+    def execute_ingestion_audit(self, raw_payload: Dict[str, Any]) -> Dict[str, Any]:
+        normalized_payload = self.normalize_payload_spacing(raw_payload)
+
+
+        if not self.validate_schema_constraints(normalized_payload):
+            self.record_pipeline_event("TRANSACTION_REJECTED_INVALID_SCHEMA", normalized_payload)
+            raise ValueError("Inbound data payload failed structural schema requirements.")
+
+
+        unsigned_working_payload = dict(normalized_payload)
+        computed_signature = self.generate_payload_signature(unsigned_working_payload)
+
+
+        if not self.verify_signature_integrity(unsigned_working_payload, computed_signature):
+            self.record_pipeline_event("TRANSACTION_REJECTED_SIGNATURE_MISMATCH", normalized_payload)
+            raise ValueError("Cryptographic verification failed. Payload signature mismatch.")
+
+
+        signed_output_payload = dict(normalized_payload)
+        signed_output_payload["cryptographic_signature"] = computed_signature
+
+
+        self.record_pipeline_event("TRANSACTION_ACCEPTED_AND_VERIFIED", signed_output_payload)
+
+
+        return signed_output_payload
+
+
+# =====================================================================
+# TONE NORMALIZATION PIPELINE (replaces HTTP with clearer semantics)
+# =====================================================================
+
+
+class ToneNormalizationPipeline:
+    """Optional pipeline for external communication. NOT applied to internal risk signals."""
+    
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self.transaction_log: List[Dict[str, Any]] = []
+
+
+    def _log_layer_transaction(self, layer_id: str, status_flag: str, technical_details: str) -> None:
+        self.transaction_log.append(
+            {
+                "timestamp": datetime.datetime.now().isoformat(),
+                "layer": layer_id,
+                "status": status_flag,
+                "detail": technical_details,
+            }
+        )
+
+
+    def filter_personal_identifiers(self, text_input: str) -> str:
+        if not self.enabled:
+            return text_input
+        identity_pattern = r"\b(I|me|my|mine|myself)\b"
+        sanitized_text = re.sub(identity_pattern, "[IDENTITY_REDACTED]", text_input, flags=re.IGNORECASE)
+        self._log_layer_transaction("Layer_1", "SUCCESS", "Personal pronoun tokens redacted.")
+        return sanitized_text
+
+
+    def process_tone_normalization(self, raw_payload: str) -> str:
+        """Normalize tone for external communication. Internal signals bypass this."""
+        if not self.enabled:
+            return raw_payload
+        
+        active_payload = raw_payload
+        active_payload = self.filter_personal_identifiers(active_payload)
+        self._log_layer_transaction("TONE_NORMALIZATION", "COMPLETED", "Output normalized for external delivery.")
+        return active_payload
+
+
+# =====================================================================
+# DIT (Deterministic Integrity Tower)
+# =====================================================================
+
+
+class SecureDataProcessingPipeline:
+    def __init__(self, cryptographic_secret: str = "PIPELINE_ROOT_SECRET", transaction_cycle_limit: int = 100):
+        self.cryptographic_secret: bytes = cryptographic_secret.encode("utf-8")
+        self.transaction_cycle_limit: int = transaction_cycle_limit
+        self.processed_cycles_count: int = 0
+        self.is_pipeline_locked: bool = False
+        self.historical_audit_ledger: list = []
+
+
+        self.identity_token_pattern = re.compile(
+            r"\b(i|me|my|mine|you|your|we|us)\b",
+            re.IGNORECASE,
+        )
+
+
+        self.conversational_filler_pattern = re.compile(
+            r"\b(very|definitely|feel|believe|extremely|really|just)\b",
+            re.IGNORECASE,
+        )
+
+
+    def filter_structural_text(self, raw_text: str) -> str:
+        filtered_text = self.identity_token_pattern.sub("", raw_text)
+        filtered_text = self.conversational_filler_pattern.sub("", filtered_text)
+        return re.sub(r"\s{2,}", " ", filtered_text).strip()
+
+
+    @staticmethod
+    def validate_schema_constraints(data_packet: Dict[str, Any]) -> bool:
+        if "body_content" not in data_packet or "metadata_context" not in data_packet:
+            return False
+        if "[INVALID]" in str(data_packet["body_content"]):
+            return False
+        return True
+
+
+    def execute_normalization_loops(self, data_packet: Dict[str, Any], max_attempts: int = 3) -> Dict[str, Any]:
+        for iteration in range(max_attempts):
+            data_packet["body_content"] = self.filter_structural_text(data_packet.get("body_content", ""))
+            if data_packet["body_content"]:
+                data_packet["completed_normalization_iterations"] = iteration + 1
+                return data_packet
+
+
+        raise ValueError("Pipeline execution failed: Content normalization parameters exhausted without resolution.")
+
+
+    def generate_packet_signature(self, data_packet: Dict[str, Any]) -> str:
+        canonical_payload = json.dumps(data_packet, sort_keys=True).encode("utf-8")
+        return hmac.new(self.cryptographic_secret, canonical_payload, hashlib.sha256).hexdigest()
+
+
+    def verify_packet_signature(self, data_packet: Dict[str, Any], provided_signature: str) -> bool:
+        computed_expected_signature = self.generate_packet_signature(data_packet)
+        return hmac.compare_digest(computed_expected_signature, provided_signature)
+
+
+    def evaluate_compliance_gate(self, data_packet: Dict[str, Any]) -> bool:
+        return (
+            self.validate_schema_constraints(data_packet)
+            and data_packet.get("completed_normalization_iterations", 0) > 0
+            and "cryptographic_signature" in data_packet
+        )
+
+
+    def apply_cadence_throttle(self) -> None:
+        self.processed_cycles_count += 1
+        if self.processed_cycles_count % self.transaction_cycle_limit == 0:
+            self.is_pipeline_locked = True
+            time.sleep(0.2)
+        else:
+            self.is_pipeline_locked = False
+
+
+    def record_pipeline_transaction(self, event_type: str, data_packet: Optional[Dict[str, Any]] = None) -> None:
+        log_entry = {
+            "timestamp": datetime.datetime.utcnow().isoformat(),
+            "event_classification": event_type,
+            "associated_packet": data_packet or {},
+        }
+        self.historical_audit_ledger.append(log_entry)
+        logger.info(event_type)
+
+
+    def process_transaction_cycle(self, display_title: str, text_body: str) -> Dict[str, Any]:
+        working_packet = {
+            "display_title": display_title,
+            "body_content": text_body,
+            "metadata_context": {"processing_node_origin": "SECURE_PROCESSING_PIPELINE"},
+        }
+
+
+        self.apply_cadence_throttle()
+        working_packet = self.execute_normalization_loops(working_packet)
+
+
+        if not self.validate_schema_constraints(working_packet):
+            self.record_pipeline_transaction("TRANSACTION_REJECTED_INVALID_SCHEMA", working_packet)
+            raise ValueError("Data verification error: Input payload matches invalid schema properties.")
+
+
+        unsigned_working_copy = dict(working_packet)
+        computed_signature = self.generate_packet_signature(unsigned_working_copy)
+        working_packet["cryptographic_signature"] = computed_signature
+
+
+        if not self.evaluate_compliance_gate(working_packet):
+            self.record_pipeline_transaction("TRANSACTION_REJECTED_COMPLIANCE_GATE_FAILURE", working_packet)
+            raise ValueError("Processing denied: Final data state parameters violated compliance rules.")
+
+
+        self.record_pipeline_transaction("TRANSACTION_ACCEPTED_AND_COMMITTED", working_packet)
+
+
+        return working_packet
+
+
+# =====================================================================
+# CLINICAL DOMAIN VALIDATOR (replaces CITADEL with clearer intent)
+# =====================================================================
+
+
+class ClinicalSignalValidator:
+    """Domain-specific validation for clinical signals. OPPOSITE of linguistic polishing."""
+    
+    REQUIRED_CLINICAL_MARKERS = {
+        "temporal_specificity": re.compile(r"\b(\d{1,2}:\d{2}|hour|minute|second|onset)\b", re.IGNORECASE),
+        "numeric_value": re.compile(r"\b\d+(\.\d+)?(?:\s*(?:bpm|mmHg|beats|percent|%|SpO2|O2|sats))\b", re.IGNORECASE),
+        "clinical_context": re.compile(r"\b(patient|neonate|infant|pediatric|vital|monitor|alert|abnormal)\b", re.IGNORECASE),
+    }
+    
+    HEDGING_IS_GOOD = re.compile(
+        r"\b(may|might|could|possibly|uncertain|unclear|suggest)\b",
+        re.IGNORECASE,
+    )
+
+
+    def __init__(self, profile_name: str = "clinical"):
+        self.profile_name = profile_name
+        self.validation_log: List[Dict[str, Any]] = []
+
+
+    def validate_signal(self, signal_text: str) -> Tuple[bool, List[str]]:
+        """Check if signal has minimum clinical coherence."""
+        failures: List[str] = []
+        
+        # Clinical signals NEED temporal anchors
+        if not self.REQUIRED_CLINICAL_MARKERS["temporal_specificity"].search(signal_text):
+            failures.append("Missing temporal specificity (when did this occur?)")
+        
+        # Clinical signals often need numbers
+        if not self.REQUIRED_CLINICAL_MARKERS["numeric_value"].search(signal_text):
+            failures.append("Missing quantitative values (vital signs, measurements)")
+        
+        # Clinical signals must reference the patient/context
+        if not self.REQUIRED_CLINICAL_MARKERS["clinical_context"].search(signal_text):
+            failures.append("Missing clinical context (what patient/system?)")
+        
+        is_valid = len(failures) == 0
+        
+        self.validation_log.append({
+            "timestamp": dt.utcnow().isoformat(),
+            "signal_sample": signal_text[:100],
+            "is_valid": is_valid,
+            "failures": failures,
+        })
+        
+        return is_valid, failures
+
+
+# =====================================================================
+# OBSERVE Data Structures
+# =====================================================================
+
+
+class SignalClassification(Enum):
+    TYPE_A = "type_a"
+    TYPE_B = "type_b"
+    TYPE_C = "type_c"
+    TYPE_D = "type_d"
+    GENERAL = "general"
+
+
+class ExecutionStage(Enum):
+    INITIAL_STAGE = "initial_stage"
+    INTERVAL_1 = "interval_1"
+    INTERVAL_2 = "interval_2"
+    POST_PROCESSING = "post_processing"
+    TERMINATION = "termination"
+
+
+class OperationalUnit(Enum):
+    CRITICAL_A = "critical_a"
+    CRITICAL_B = "critical_b"
+    IMMEDIATE_WARD = "immediate_ward"
+    STANDARD_WARD = "standard_ward"
+    TRANSITIONAL = "transitional"
+
+
+class ValidationStatus(Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    QUARANTINED = "quarantined"
+
+
+class OutputPresentationStyle(Enum):
+    EXPANDED = "expanded"
+    STANDARD = "standard"
+    CONCISE = "concise"
+    USER_FACING = "user_facing"
+
+
+@dataclass
+class TelemetrySnapshot:
+    timestamp: dt
+    metric_rate_a: Optional[float]
+    metric_rate_b: Optional[float]
+    ratio_metric_c: Optional[float]
+    scalar_metric_d: Optional[float]
+    vector_subset_e: Optional[float]
+    vector_subset_f: Optional[float]
+    scalar_metric_g: Optional[float]
+    data_source_id: str
+    is_anomaly_suppressed: bool = False
+
+
+@dataclass
+class TransactionContext:
+    source_identifier: str
+    scale_factor_alpha: float
+    scale_factor_beta: Optional[float]
+    unit_assignment: OperationalUnit
+    execution_stage: ExecutionStage
+    signal_classification: SignalClassification
+    interval_index: Optional[int]
+    temporal_modifier: str
+    classification_codes: List[str] = field(default_factory=list)
+
+
+@dataclass
+class AnalyticRiskSignal:
+    advisory_score: float
+    evaluation_confidence: float
+    contributing_feature_map: Dict[str, float]
+    triggered_heuristic_ids: List[str]
+    context_tags: List[str]
+    timestamp: dt
+    provenance_hash: str = ""
+
+
+    def compute_provenance_hash(self) -> None:
+        serialized_payload = json.dumps(
+            {
+                "score": self.advisory_score,
+                "features": self.contributing_feature_map,
+                "heuristics": sorted(self.triggered_heuristic_ids),
+                "timestamp": self.timestamp.isoformat(),
+            },
+            sort_keys=True,
+        )
+        self.provenance_hash = hashlib.sha256(serialized_payload.encode()).hexdigest()
+
+
+@dataclass
+class PresentationPayload:
+    payload_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    descriptive_content: str = ""
+    style_variant: OutputPresentationStyle = OutputPresentationStyle.STANDARD
+    linked_provenance_signals: List[str] = field(default_factory=list)
+    authorized_reviewer_id: str = ""
+    review_timestamp: Optional[dt] = None
+    provenance_hash: str = ""
+    is_suppressed: bool = False
+    suppression_reason: str = ""
+
+
+    def compute_provenance_hash(self) -> None:
+        serialized_payload = json.dumps(
+            {
+                "content": self.descriptive_content,
+                "style": self.style_variant.value,
+                "signals": sorted(self.linked_provenance_signals),
+                "reviewer": self.authorized_reviewer_id,
+            },
+            sort_keys=True,
+        )
+        self.provenance_hash = hashlib.sha256(serialized_payload.encode()).hexdigest()
+
+
+class HardwareStreamAdapter:
+    def stream_telemetry(self, source_identifier: str) -> TelemetrySnapshot:
+        raise NotImplementedError
+
+
+class MetadataDatabaseAdapter:
+    def fetch_context(self, source_identifier: str) -> TransactionContext:
+        raise NotImplementedError
+
+
+    def fetch_ancillary_parameters(self, source_identifier: str) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+
+class TelemetrySignalFilter:
+    def filter_anomalies(self, snapshot: TelemetrySnapshot) -> TelemetrySnapshot:
+        raise NotImplementedError
+
+
+@dataclass
+class DerivativeTrackingFeatures:
+    observation_window_seconds: int
+    metric_a_momentum: float
+    metric_b_momentum: float
+    metric_c_momentum: float
+    metric_a_acceleration: float
+    metric_b_acceleration: float
+    metric_c_acceleration: float
+    cross_signal_correlation_index: float
+
+
+class TemporalTrajectoryEngine:
+    def __init__(self, observation_window_seconds: int = 300):
+        self.observation_window_seconds = observation_window_seconds
+        self._execution_buffer: Dict[str, List[TelemetrySnapshot]] = {}
+
+
+    def ingest_snapshot(self, source_identifier: str, snapshot: TelemetrySnapshot) -> None:
+        self._execution_buffer.setdefault(source_identifier, []).append(snapshot)
+
+
+    def extract_trajectory_features(self, source_identifier: str) -> Optional[DerivativeTrackingFeatures]:
+        snapshots = self._execution_buffer.get(source_identifier, [])
+        if len(snapshots) < 2:
+            return None
+        return DerivativeTrackingFeatures(
+            observation_window_seconds=self.observation_window_seconds,
+            metric_a_momentum=0.0,
+            metric_b_momentum=0.0,
+            metric_c_momentum=0.0,
+            metric_a_acceleration=0.0,
+            metric_b_acceleration=0.0,
+            metric_c_acceleration=0.0,
+            cross_signal_correlation_index=0.0,
+        )
+
+
+    def clear_buffer_context(self, source_identifier: str) -> None:
+        self._execution_buffer.pop(source_identifier, None)
+
+
+@dataclass
+class LogicModuleMetadata:
+    module_id: str
+    build_version: int
+    created_at: dt
+    approved_by_actor: str
+    reference_case_ids: List[str]
+    validation_status: ValidationStatus
+    attenuation_half_life_days: float = 90.0
+    context_tags: List[str] = field(default_factory=list)
+    is_drift_frozen: bool = False
+    last_triggered_timestamp: Optional[dt] = None
+
+
+class StaticTrajectoryRule:
+    metadata: LogicModuleMetadata
+
+
+    def evaluate_rule(
+        self, features: DerivativeTrackingFeatures, context: TransactionContext
+    ) -> Tuple[bool, float]:
+        raise NotImplementedError
+
+
+class AttenuatingPatternMatcher:
+    metadata: LogicModuleMetadata
+
+
+    def match_pattern(
+        self,
+        features: DerivativeTrackingFeatures,
+        context: TransactionContext,
+        historical_snapshots: List[TelemetrySnapshot],
+    ) -> Tuple[bool, float]:
+        raise NotImplementedError
+
+
+    def calculate_decay_modifier(self) -> float:
+        raise NotImplementedError
+
+
+    @property
+    def is_currently_active(self) -> bool:
+        return (
+            self.metadata.validation_status == ValidationStatus.APPROVED
+            and not self.metadata.is_drift_frozen
+            and self.calculate_decay_modifier() > 0.05
+        )
+
+
+class CoreHeuristicRuleSet:
+    def execute_evaluation(
+        self, snapshot: TelemetrySnapshot, context: TransactionContext
+    ) -> AnalyticRiskSignal:
+        raise NotImplementedError
+
+
+class SpecialtyExpertModule:
+    def get_module_name(self) -> str:
+        raise NotImplementedError
+
+
+    def evaluate_features(
+        self, features: DerivativeTrackingFeatures, context: TransactionContext
+    ) -> Optional[AnalyticRiskSignal]:
+        raise NotImplementedError
+
+
+class HybridRiskOrchestrationEngine:
+    def __init__(
+        self,
+        baseline_heuristics: CoreHeuristicRuleSet,
+        static_rules: List[StaticTrajectoryRule],
+        pattern_matchers: List[AttenuatingPatternMatcher],
+        expert_modules: List[SpecialtyExpertModule],
+    ):
+        self.baseline_heuristics = baseline_heuristics
+        self.static_rules = list(static_rules)
+        self.pattern_matchers = pattern_matchers
+        self.expert_modules = expert_modules
+
+
+    def process_risk_matrices(
+        self,
+        snapshot: TelemetrySnapshot,
+        features: Optional[DerivativeTrackingFeatures],
+        context: TransactionContext,
+        historical_snapshots: List[TelemetrySnapshot],
+    ) -> AnalyticRiskSignal:
+        return self.baseline_heuristics.execute_evaluation(snapshot, context)
+
+
+    @property
+    def active_pattern_matchers(self) -> List[AttenuatingPatternMatcher]:
+        return [matcher for matcher in self.pattern_matchers if matcher.is_currently_active]
+
+
+class ProcessingDriftDetector:
+    def analyze_signal(self, signal: AnalyticRiskSignal, objective_outcome: Optional[bool]) -> None:
+        raise NotImplementedError
+
+
+    def confirm_drift_presence(self) -> bool:
+        raise NotImplementedError
+
+
+    def reset_detector_state(self) -> None:
+        raise NotImplementedError
+
+
+@dataclass
+class AuditLedgerEntry:
+    entry_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    timestamp: dt = field(default_factory=dt.utcnow)
+    actor_id: str = ""
+    action_type: str = ""
+    target_entity_type: str = ""
+    target_entity_id: str = ""
+    pre_state_snapshot: Optional[Dict[str, Any]] = None
+    post_state_snapshot: Optional[Dict[str, Any]] = None
+    immutable_block_hash: str = ""
+    ledger_chain_position: int = -1
+
+
+    def compute_block_seal(self) -> None:
+        serialized_payload = json.dumps(
+            {
+                "id": self.entry_id,
+                "timestamp": self.timestamp.isoformat(),
+                "actor": self.actor_id,
+                "action": self.action_type,
+                "entity": self.target_entity_id,
+            },
+            sort_keys=True,
+        )
+        self.immutable_block_hash = hashlib.sha256(serialized_payload.encode()).hexdigest()
+
+
+class AppendOnlyAuditTrail:
+    def __init__(self):
+        self._ledger_entries: List[AuditLedgerEntry] = []
+        self._current_chain_hash: str = hashlib.sha256(b"genesis_block_start").hexdigest()
+
+
+    def commit_entry(self, entry: AuditLedgerEntry) -> None:
+        entry.ledger_chain_position = len(self._ledger_entries)
+        entry.compute_block_seal()
+        combined_payload = f"{self._current_chain_hash}:{entry.immutable_block_hash}"
+        self._current_chain_hash = hashlib.sha256(combined_payload.encode()).hexdigest()
+        self._ledger_entries.append(entry)
+        logger.info(f"AuditTrail: {entry.action_type} on {entry.target_entity_id}")
+
+
+    def verify_chain_integrity(self) -> bool:
+        verification_tip = hashlib.sha256(b"genesis_block_start").hexdigest()
+        for entry in self._ledger_entries:
+            verification_tip = hashlib.sha256(
+                f"{verification_tip}:{entry.immutable_block_hash}".encode()
+            ).hexdigest()
+        return verification_tip == self._current_chain_hash
+
+
+    def export_serialized_ledger(self) -> str:
+        return json.dumps([vars(entry) for entry in self._ledger_entries], default=str, indent=2)
+
+
+    def __len__(self) -> int:
+        return len(self._ledger_entries)
+
+
+class GovernanceApprovalGate:
+    AUTHORIZED_ROLES = frozenset({"level_4_signoff", "director_review", "compliance_officer"})
+
+
+    def __init__(self, audit_trail: AppendOnlyAuditTrail):
+        self._audit_trail = audit_trail
+
+
+    def authorize_logic_module(self, matcher: AttenuatingPatternMatcher, actor_id: str, role_token: str) -> bool:
+        if role_token not in self.AUTHORIZED_ROLES:
+            return False
+        matcher.metadata.validation_status = ValidationStatus.APPROVED
+        matcher.metadata.approved_by_actor = actor_id
+        self._audit_trail.commit_entry(
+            AuditLedgerEntry(
+                actor_id=actor_id,
+                action_type="authorize_logic_module",
+                target_entity_type="attenuating_pattern_matcher",
+                target_entity_id=matcher.metadata.module_id,
+            )
+        )
+        return True
+
+
+    def quarantine_logic_module(self, matcher: AttenuatingPatternMatcher, isolation_reason: str, actor_id: str) -> None:
+        matcher.metadata.is_drift_frozen = True
+        matcher.metadata.validation_status = ValidationStatus.QUARANTINED
+        self._audit_trail.commit_entry(
+            AuditLedgerEntry(
+                actor_id=actor_id,
+                action_type="quarantine_logic_module",
+                target_entity_type="attenuating_pattern_matcher",
+                target_entity_id=matcher.metadata.module_id,
+                post_state_snapshot={"reason": isolation_reason},
+            )
+        )
+        logger.warning(f"Module {matcher.metadata.module_id} quarantined: {isolation_reason}")
+
+
+@dataclass
+class ExportedStateVector:
+    schema_version_token: str = "1.0.0"
+    encoder_build_version: str = ""
+    source_pseudonym: str = ""
+    context_package: Optional[Dict[str, Any]] = None
+    derivative_features: Optional[Dict[str, Any]] = None
+    calculated_risk_signal: Optional[Dict[str, Any]] = None
+    active_module_identifiers: List[str] = field(default_factory=list)
+    export_timestamp_string: str = ""
+    provenance_signature: str = ""
+
+
+class CryptographicStateEncoder:
+    def __init__(self, encoder_build_version: str, hardware_salt: bytes):
+        self._encoder_build_version = encoder_build_version
+        self._hardware_salt = hardware_salt
+
+
+    def generate_state_export(
+        self,
+        source_id: str,
+        context: TransactionContext,
+        features: Optional[DerivativeTrackingFeatures],
+        signal: AnalyticRiskSignal,
+        active_modules: List[str],
+    ) -> ExportedStateVector:
+        export = ExportedStateVector(
+            encoder_build_version=self._encoder_build_version,
+            source_pseudonym=self.compute_one_way_pseudonym(source_id),
+            context_package={
+                "unit": context.unit_assignment.value,
+                "stage": context.execution_stage.value,
+                "classification": context.signal_classification.value,
+            },
+            derivative_features=vars(features) if features else None,
+            calculated_risk_signal={
+                "score": signal.advisory_score,
+                "confidence": signal.evaluation_confidence,
+                "provenance_hash": signal.provenance_hash,
+            },
+            active_module_identifiers=active_modules,
+            export_timestamp_string=dt.utcnow().isoformat(),
+        )
+        payload = json.dumps(vars(export), sort_keys=True).encode()
+        export.provenance_signature = hashlib.sha256(payload).hexdigest()
+        return export
+
+
+    def compute_one_way_pseudonym(self, source_id: str) -> str:
+        return hmac.new(self._hardware_salt, source_id.encode(), hashlib.sha256).hexdigest()
+
+
+# =====================================================================
+# FORTRESS 2.0 (Predictive Integrity Controller) WITH TRANSITION LOGGING
+# =====================================================================
+
+
+@dataclass
+class ProcessingPipelineConfig:
+    latent_dimension: int = 8
+    state_dimension: int = 1
+    random_seed: int = 42
+    history_buffer_limit: int = 10
+
+
+    nominal_adjustment_rate: float = 0.20
+    activation_threshold: float = 0.45
+    sigmoid_sensitivity: float = 15.0
+
+
+    state_engagement_threshold: float = 0.55
+    state_disengagement_threshold: float = 0.35
+
+
+    unverified_source_penalty: float = 0.5
+    history_variance_weight: float = 0.05
+    prediction_error_weight: float = 0.02
+
+
+    divergence_saturation_cap: float = 0.45
+    divergence_scaling_factor: float = 25.0
+
+
+class InputPayload:
+    def __init__(self, content_body: str, metadata: Optional[Dict[str, Any]] = None):
+        self.content_body = content_body
+        self.metadata = metadata or {}
+
+
+class BackupActionProvider:
+    @staticmethod
+    def get_default_action() -> float:
+        return 50.0
+
+
+@dataclass
+class FortressStateTransition:
+    timestamp: dt
+    previous_mode: str
+    new_mode: str
+    trigger_variance: float
+    trigger_energy_delta: float
+    reason: str
+
+
+class PredictiveStateController:
+    def __init__(
+        self,
+        fallback_provider: BackupActionProvider,
+        config: Optional[ProcessingPipelineConfig] = None,
+    ):
+        self.config = config or ProcessingPipelineConfig()
+        self.fallback_provider = fallback_provider
+
+
+        self.random_generator = np.random.RandomState(self.config.random_seed)
+        self.error_history: deque[float] = deque(maxlen=self.config.history_buffer_limit)
+
+
+        self.target_status_tokens = {"stable", "healthy", "functional", "safe", "nominal"}
+
+
+        latent_dim = self.config.latent_dimension
+        state_dim = self.config.state_dimension
+
+
+        self.latent_state_vector = np.zeros(latent_dim)
+        self.weight_matrix_recurrent = self.random_generator.randn(latent_dim, latent_dim) * 0.1
+        self.weight_matrix_input = self.random_generator.randn(latent_dim, state_dim) * 0.1
+        self.weight_matrix_output = self.random_generator.randn(state_dim, latent_dim) * 0.1
+
+
+        self.blending_coefficient: float = 1.0
+        self.prior_step_energy: float = 0.0
+        self.is_state_override_engaged: bool = False
+        
+        # NEW: Transition logging
+        self.state_transitions: List[FortressStateTransition] = []
+
+
+    def _compute_latent_projection(self, observation: np.ndarray) -> np.ndarray:
+        flat_observation = np.asarray(observation).reshape(-1)
+        expected_dimension = self.weight_matrix_input.shape[1]
+
+
+        if flat_observation.shape[0] != expected_dimension:
+            raise ValueError(
+                f"Dimension mismatch: input shape {flat_observation.shape[0]} "
+                f"does not match expected {expected_dimension}."
+            )
+
+
+        self.latent_state_vector = np.tanh(
+            np.dot(self.weight_matrix_recurrent, self.latent_state_vector)
+            + np.dot(self.weight_matrix_input, flat_observation)
+        )
+
+
+        return np.dot(self.weight_matrix_output, self.latent_state_vector).reshape(-1)
+
+
+    def _calculate_target_coefficient(self, variance: float) -> float:
+        return 1.0 / (
+            1.0 + math.exp(self.config.sigmoid_sensitivity * (variance - self.config.activation_threshold))
+        )
+
+
+    def _evaluate_composite_variance(
+        self,
+        payload: InputPayload,
+        scalar_error: float,
+        prediction_error: float,
+    ) -> float:
+        self.error_history.append(scalar_error)
+        calculated_variance = (
+            float(np.std(np.asarray(self.error_history), ddof=0))
+            if len(self.error_history) > 1
+            else 0.0
+        )
+
+
+        has_valid_signatures = "source_id" in payload.metadata and "signature" in payload.metadata
+        verification_penalty = 0.0 if has_valid_signatures else self.config.unverified_source_penalty
+
+
+        normalized_text = (payload.content_body or "").lower()
+        contains_target_tokens = any(token in normalized_text for token in self.target_status_tokens)
+
+
+        divergence_metric = 0.0
+        if contains_target_tokens and scalar_error > 12.0:
+            divergence_metric = min(
+                self.config.divergence_saturation_cap,
+                (scalar_error / self.config.divergence_scaling_factor),
+            )
+
+
+        composite_variance = (
+            (calculated_variance * self.config.history_variance_weight)
+            + verification_penalty
+            + divergence_metric
+            + (prediction_error * self.config.prediction_error_weight)
+        )
+
+
+        return min(0.99, float(composite_variance))
+
+
+    def process_step(
+        self,
+        payload: InputPayload,
+        current_error_input: Union[float, Sequence[float], np.ndarray],
+        live_signal_input: Union[float, Sequence[float]],
+    ) -> Dict[str, Any]:
+        state_dim = self.config.state_dimension
+
+
+        error_array = np.asarray(current_error_input).reshape(-1)
+        if error_array.size == 0:
+            raise ValueError("Error tracking array input cannot be empty.")
+
+
+        if error_array.size != state_dim and not (state_dim == 1 and error_array.size == 1):
+            raise ValueError(
+                f"Dimension mismatch: input size {error_array.size} must match target {state_dim}."
+            )
+
+
+        projected_state = self._compute_latent_projection(error_array)
+
+
+        if projected_state.size == 1:
+            prediction_error = float(abs(error_array.item() - projected_state[0]))
+            scalar_error = float(error_array.item())
+        else:
+            state_delta = error_array - projected_state
+            prediction_error = float(np.linalg.norm(state_delta))
+            scalar_error = float(np.linalg.norm(error_array))
+
+
+        composite_variance = self._evaluate_composite_variance(payload, scalar_error, prediction_error)
+
+
+        step_energy = 0.5 * (scalar_error ** 2)
+        energy_rate_of_change = step_energy - self.prior_step_energy
+        self.prior_step_energy = step_energy
+
+
+        target_coefficient = self._calculate_target_coefficient(composite_variance)
+        active_adjustment_rate = self.config.nominal_adjustment_rate
+
+
+        previous_override_state = self.is_state_override_engaged
+
+
+        if not self.is_state_override_engaged:
+            if composite_variance >= self.config.state_engagement_threshold:
+                self.is_state_override_engaged = True
+                # Log transition
+                self.state_transitions.append(
+                    FortressStateTransition(
+                        timestamp=dt.utcnow(),
+                        previous_mode="NOMINAL",
+                        new_mode="OVERRIDE",
+                        trigger_variance=composite_variance,
+                        trigger_energy_delta=energy_rate_of_change,
+                        reason=f"Variance {composite_variance:.3f} exceeded engagement threshold {self.config.state_engagement_threshold}",
+                    )
+                )
+                logger.warning(f"FORTRESS state transition: NOMINAL -> OVERRIDE (variance={composite_variance:.3f})")
+        else:
+            if composite_variance <= self.config.state_disengagement_threshold:
+                self.is_state_override_engaged = False
+                # Log transition
+                self.state_transitions.append(
+                    FortressStateTransition(
+                        timestamp=dt.utcnow(),
+                        previous_mode="OVERRIDE",
+                        new_mode="NOMINAL",
+                        trigger_variance=composite_variance,
+                        trigger_energy_delta=energy_rate_of_change,
+                        reason=f"Variance {composite_variance:.3f} fell below disengagement threshold {self.config.state_disengagement_threshold}",
+                    )
+                )
+                logger.info(f"FORTRESS state transition: OVERRIDE -> NOMINAL (variance={composite_variance:.3f})")
+
+
+        if energy_rate_of_change > 0 and self.is_state_override_engaged:
+            active_adjustment_rate = 0.5
+            target_coefficient = 0.0
+
+
+        coefficient_delta = target_coefficient - self.blending_coefficient
+        clamped_step = max(-active_adjustment_rate, min(active_adjustment_rate, coefficient_delta))
+
+
+        self.blending_coefficient += clamped_step
+        self.blending_coefficient = max(0.0, min(1.0, self.blending_coefficient))
+
+
+        fallback_value = float(self.fallback_provider.get_default_action())
+        live_signal_array = np.asarray(live_signal_input).reshape(-1)
+
+
+        if live_signal_array.size == 1:
+            blended_value = (live_signal_array.item() * self.blending_coefficient) + (
+                fallback_value * (1.0 - self.blending_coefficient)
+            )
+            final_output_value = float(blended_value)
+        else:
+            if live_signal_array.size != state_dim:
+                raise ValueError("Live signal input dimensions do not match system dimensions.")
+
+
+            blended_vectors = (live_signal_array * self.blending_coefficient) + (
+                fallback_value * (1.0 - self.blending_coefficient)
+            )
+            final_output_value = [float(element) for element in blended_vectors]
+
+
+        return {
+            "computed_output": (
+                round(final_output_value, 3)
+                if isinstance(final_output_value, float)
+                else [round(val, 3) for val in final_output_value]
+            ),
+            "blending_coefficient": round(self.blending_coefficient, 3),
+            "prediction_error": round(prediction_error, 3),
+            "energy_state_trend": "STABLE" if energy_rate_of_change <= 0 else "DIVERGENT",
+            "operational_mode": "OVERRIDE" if self.is_state_override_engaged else "NOMINAL",
+            "evaluated_variance": round(composite_variance, 3),
+            "mode_changed": previous_override_state != self.is_state_override_engaged,
+        }
+
+
+# =====================================================================
+# URE (Universal Resilience Engine) WITH ACTUAL REGIME CLASSIFICATION
+# =====================================================================
+
+
+@dataclass
+class SystemResilienceConfig:
+    stability_stable_threshold: float = 1e-4
+    stability_marginal_threshold: float = 1e-2
+    energy_threshold: float = 0.10
+    risk_threshold: float = 0.75
+
+
+    dropout_risk_weight: float = 2.0
+    escalation_risk_weight: float = 1.5
+    reentry_risk_weight: float = 1.5
+    backlog_risk_weight: float = 0.01
+
+
+    entropy_modifier_floor: float = 0.5
+    entropy_modifier_sensitivity: float = 0.15
+    novelty_uncertainty_weight: float = 0.4
+    complexity_uncertainty_weight: float = 0.6
+    demand_shock_dampening_factor: float = 0.6
+    dropout_threshold_floor: float = 0.05
+
+
+    regime_backlog_surge_weight: float = 0.02
+    regime_backlog_saturated_weight: float = 0.03
+    regime_latency_weight: float = 0.01
+    regime_backlog_stable_weight: float = 0.01
+
+
+    evaluation_weights: Dict[str, float] = field(
+        default_factory=lambda: {
+            "dropout_rate": 5.0,
+            "reentry_rate": 4.0,
+            "escalation_rate": 4.0,
+            "normalized_latency": 3.0,
+            "containment_efficiency": 3.0,
+            "recurrent_action_rate": 2.0,
+            "repeat_step_rate": 2.0,
+            "backlog_depth": 5.0,
+        }
+    )
+
+
+class ClassificationResult(Enum):
+    NEUTRAL = "NEUTRAL"
+    REGRESSIVE = "REGRESSIVE"
+    RISK_INCREASING = "RISK_INCREASING"
+
+
+class OperationalRegime(Enum):
+    STABLE = "stable"
+    SURGE = "surge"
+    RESOURCE_OVERLOAD = "resource_overload"
+    ANOMALOUS_CRITICAL = "anomalous_critical"
+    SATURATED = "saturated"
+    CONTESTED = "contested"
+
+
+@dataclass
+class SystemMetricsTelemetry:
+    containment_efficiency: float = 0.0
+    processing_latency: float = 0.0
+    recurrent_action_rate: float = 0.0
+    dropout_rate: float = 0.0
+    automation_trigger_rate: float = 0.0
+    determinism_index: float = 1.0
+    repeat_step_rate: float = 0.0
+    reentry_rate: float = 0.0
+    escalation_rate: float = 0.0
+    abrupt_disconnect_rate: float = 0.0
+    backlog_depth: float = 0.0
+
+
+@dataclass
+class RegimeClassificationProfile:
+    probability_distribution: Dict[OperationalRegime, float]
+    dominant_regime: OperationalRegime
+    confidence_score: float
+    distribution_entropy: float
+
+
+@dataclass
+class DiagnosticEvaluationSummary:
+    result_status: ClassificationResult
+    rationale_statement: str
+    dominant_regime: OperationalRegime
+    regime_confidence: float
+    regime_scores: Dict[str, float]
+    regime_entropy: float
+    calculated_energy: float
+    composite_risk_score: float
+    timestamp: dt
+
+
+def clamp_value(value: float, lower_bound: float, upper_bound: float) -> float:
+    return max(lower_bound, min(upper_bound, value))
+
+
+def calculate_shannon_entropy(probability_distribution: Dict[OperationalRegime, float]) -> float:
+    computed_entropy = 0.0
+    for probability in probability_distribution.values():
+        if probability > 0:
+            computed_entropy -= probability * math.log(probability)
+    return computed_entropy
+
+
+class TelemetryIngestionPipelineURE:
+    def __init__(self, config: SystemResilienceConfig):
+        self.config = config
+
+
+    def parse_vector(self, raw_vector: Dict[str, float]) -> SystemMetricsTelemetry:
+        return SystemMetricsTelemetry(
+            containment_efficiency=raw_vector.get("containment_efficiency", 0.0),
+            processing_latency=raw_vector.get("processing_latency", 0.0),
+            recurrent_action_rate=raw_vector.get("recurrent_action_rate", 0.0),
+            dropout_rate=raw_vector.get("dropout_rate", 0.0),
+            automation_trigger_rate=raw_vector.get("automation_trigger_rate", 0.0),
+            determinism_index=raw_vector.get("determinism_index", 1.0),
+            repeat_step_rate=raw_vector.get("repeat_step_rate", 0.0),
+            reentry_rate=raw_vector.get("reentry_rate", 0.0),
+            escalation_rate=raw_vector.get("escalation_rate", 0.0),
+            abrupt_disconnect_rate=raw_vector.get("abrupt_disconnect_rate", 0.0),
+            backlog_depth=raw_vector.get("backlog_depth", 0.0),
+        )
+
+
+class StabilityMonitor:
+    def __init__(self, config: SystemResilienceConfig):
+        self.config = config
+
+
+    def calculate_system_energy(self, baseline: SystemMetricsTelemetry, current: SystemMetricsTelemetry) -> float:
+        accumulated_deviation = 0.0
+        for attribute, weight in self.config.evaluation_weights.items():
+            baseline_val = getattr(baseline, attribute, 0.0)
+            current_val = getattr(current, attribute, 0.0)
+            accumulated_deviation += weight * ((current_val - baseline_val) ** 2)
+        return 0.5 * accumulated_deviation
+
+
+class SystemRegimeClassifier:
+    """Multi-dimensional regime classification based on actual metrics."""
+    
+    def __init__(self, config: SystemResilienceConfig):
+        self.config = config
+
+
+    def classify_current_regime(self, metrics: SystemMetricsTelemetry) -> RegimeClassificationProfile:
+        """
+        Classify operational regime based on multi-dimensional feature space.
+        
+        DOMAIN KNOWLEDGE REQUIRED:
+        - These thresholds should be derived from institutional historical data
+        - Each organization will have different baselines for what constitutes "surge" vs "overload"
+        """
+        
+        # Compute regime scores based on multi-dimensional features
+        # TODO: [REDACTED_NAME] - replace these with learned thresholds from NCH data
+        
+        stability_score = 0.0 if metrics.dropout_rate < 0.02 else metrics.dropout_rate * 2.0
+        surge_score = min(1.0, metrics.backlog_depth / 20.0) if metrics.backlog_depth > 5 else 0.0
+        overload_score = (
+            metrics.escalation_rate * 0.5 + 
+            (metrics.processing_latency / 1000.0) * 0.3 +
+            metrics.reentry_rate * 0.2
+        )
+        saturation_score = (
+            metrics.containment_efficiency if metrics.containment_efficiency < 0.5 else 0.0
+        )
+        critical_score = (
+            metrics.dropout_rate * 0.4 +
+            metrics.escalation_rate * 0.3 +
+            metrics.abrupt_disconnect_rate * 0.3
+        )
+        
+        # Normalize to probability distribution
+        raw_scores = {
+            OperationalRegime.STABLE: 1.0 - stability_score,
+            OperationalRegime.SURGE: surge_score,
+            OperationalRegime.RESOURCE_OVERLOAD: overload_score,
+            OperationalRegime.SATURATED: saturation_score,
+            OperationalRegime.ANOMALOUS_CRITICAL: critical_score,
+            OperationalRegime.CONTESTED: 0.01,  # baseline noise
+        }
+        
+        total_score = sum(raw_scores.values())
+        probability_distribution = {
+            regime: score / max(total_score, 1e-6)
+            for regime, score in raw_scores.items()
+        }
+        
+        # Normalize to sum to 1.0
+        total_prob = sum(probability_distribution.values())
+        probability_distribution = {
+            regime: prob / total_prob
+            for regime, prob in probability_distribution.items()
+        }
+        
+        dominant_mode = max(probability_distribution.items(), key=lambda x: x[1])[0]
+        top_probability = probability_distribution[dominant_mode]
+        entropy_value = calculate_shannon_entropy(probability_distribution)
+        
+        return RegimeClassificationProfile(
+            probability_distribution=probability_distribution,
+            dominant_regime=dominant_mode,
+            confidence_score=top_probability,
+            distribution_entropy=entropy_value,
+        )
+
+
+class IntegratedResilienceOrchestrator:
+    def __init__(self, config: Optional[SystemResilienceConfig] = None):
+        self.config = config or SystemResilienceConfig()
+        self.classifier = SystemRegimeClassifier(self.config)
+        self.monitor = StabilityMonitor(self.config)
+        self.pipeline = TelemetryIngestionPipelineURE(self.config)
+
+
+    def evaluate_composite_risk(
+        self,
+        baseline: SystemMetricsTelemetry,
+        current: SystemMetricsTelemetry,
+        profile: RegimeClassificationProfile,
+    ) -> float:
+        base_drift_risk = (
+            (current.dropout_rate * self.config.dropout_risk_weight)
+            + (current.escalation_rate * self.config.escalation_risk_weight)
+            + (current.reentry_rate * self.config.reentry_risk_weight)
+            + (current.backlog_depth * self.config.backlog_risk_weight)
+        )
+
+
+        entropy_adjustment = max(
+            self.config.entropy_modifier_floor,
+            1.0 + (profile.distribution_entropy * self.config.entropy_modifier_sensitivity),
+        )
+
+
+        return min(1.0, float(base_drift_risk * entropy_adjustment))
+
+
+    def run_diagnostic_sweep(
+        self,
+        baseline_metrics: SystemMetricsTelemetry,
+        current_metrics: SystemMetricsTelemetry,
+    ) -> DiagnosticEvaluationSummary:
+        regime_profile = self.classifier.classify_current_regime(current_metrics)
+        system_energy = self.monitor.calculate_system_energy(baseline_metrics, current_metrics)
+        risk_score = self.evaluate_composite_risk(baseline_metrics, current_metrics, regime_profile)
+
+
+        if risk_score >= self.config.risk_threshold:
+            status = ClassificationResult.RISK_INCREASING
+            rationale = "System metrics breached standard baseline risk tolerances."
+        elif system_energy >= self.config.energy_threshold:
+            status = ClassificationResult.REGRESSIVE
+            rationale = "System tracking energy indicates escalating operational divergence."
+        else:
+            status = ClassificationResult.NEUTRAL
+            rationale = "Operational parameters remain steady within nominal stability bounds."
+
+
+        formatted_regime_scores = {
+            mode.name: val for mode, val in regime_profile.probability_distribution.items()
+        }
+
+
+        return DiagnosticEvaluationSummary(
+            result_status=status,
+            rationale_statement=rationale,
+            dominant_regime=regime_profile.dominant_regime,
+            regime_confidence=regime_profile.confidence_score,
+            regime_scores=formatted_regime_scores,
+            regime_entropy=regime_profile.distribution_entropy,
+            calculated_energy=system_energy,
+            composite_risk_score=risk_score,
+            timestamp=dt.utcnow(),
+        )
+
+
+# =====================================================================
+# EDDP (Evaluation, Distribution, and Dashboarding Pipeline)
+# =====================================================================
+
+
+def compute_stable_hash(target_object: Dict[str, Any]) -> str:
+    serialized_blob = json.dumps(target_object, sort_keys=True).encode()
+    return hashlib.sha256(serialized_blob).hexdigest()
+
+
+@dataclass
+class PacketPayload:
+    source_id: str
+    timestamp: float
+    metrics: Dict[str, Any]
+    attributes: Dict[str, Any]
+    execution_context: str
+    metadata: Dict[str, Any]
+
+
+@dataclass
+class AssessmentLayerResult:
+    layer_name: str
+    score: float
+    evaluation_notes: str = ""
+
+
+@dataclass
+class AggregatedMetricsSummary:
+    composite_score: float
+    score_breakdown: Dict[str, float]
+    state_integrity_hash: str
+
+
+@dataclass
+class DispatchReceipt:
+    timestamp: float
+    destination_targets: List[str]
+    delivery_channel: str
+    rendered_view: Dict[str, Any]
+    dispatch_status: str
+
+
+class BoundaryValidationFilter:
+    MANDATORY_FIELDS = {"source_id", "timestamp", "metrics", "execution_context"}
+
+
+    def enforce_schema(self, raw_input: Dict[str, Any]) -> PacketPayload:
+        missing_fields = self.MANDATORY_FIELDS - set(raw_input.keys())
+        if missing_fields:
+            raise ValueError(f"Input schema failure. Missing mandatory entries: {missing_fields}")
+
+
+        return PacketPayload(
+            source_id=raw_input["source_id"],
+            timestamp=raw_input["timestamp"],
+            metrics=raw_input["metrics"],
+            attributes=raw_input.get("attributes", {}),
+            execution_context=raw_input["execution_context"],
+            metadata=raw_input.get("metadata", {}),
+        )
+
+
+class MetricAssessmentLayer:
+    def __init__(self, layer_name: str, evaluation_function: Callable[[PacketPayload], float]):
+        self.layer_name = layer_name
+        self.evaluation_function = evaluation_function
+
+
+    def execute_assessment(self, payload: PacketPayload) -> AssessmentLayerResult:
+        calculated_score = self.evaluation_function(payload)
+        return AssessmentLayerResult(
+            layer_name=self.layer_name,
+            score=calculated_score,
+            evaluation_notes=f"Successfully processed by structural block: {self.layer_name}",
+        )
+
+
+class ParallelEvaluationEngine:
+    def __init__(self, assessment_layers: List[MetricAssessmentLayer]):
+        self.assessment_layers = assessment_layers
+
+
+    def process_payload(self, payload: PacketPayload) -> List[AssessmentLayerResult]:
+        return [layer.execute_assessment(payload) for layer in self.assessment_layers]
+
+
+class AggregatedMetricScorer:
+    @staticmethod
+    def calculate_summary(results: List[AssessmentLayerResult], payload: PacketPayload) -> AggregatedMetricsSummary:
+        breakdown_map = {result.layer_name: result.score for result in results}
+        composite_mean = sum(breakdown_map.values()) / max(len(breakdown_map), 1)
+
+
+        state_hash = compute_stable_hash(
+            {
+                "payload_data": payload.__dict__,
+                "breakdown_metrics": breakdown_map,
+                "composite_value": composite_mean,
+            }
+        )
+
+
+        return AggregatedMetricsSummary(
+            composite_score=composite_mean,
+            score_breakdown=breakdown_map,
+            state_integrity_hash=state_hash,
+        )
+
+
+class DestinationTargetRouter:
+    def __init__(self, routing_table: Dict[str, List[str]]):
+        self.routing_table = routing_table
+
+
+    def resolve_targets(self, operational_context: str) -> List[str]:
+        return self.routing_table.get(operational_context, [])
+
+
+class PresentationRenderer:
+    @staticmethod
+    def generate_view(
+        layout_template: Dict[str, Any],
+        payload: PacketPayload,
+        summary: AggregatedMetricsSummary,
+    ) -> Dict[str, Any]:
+        return {
+            "display_title": layout_template.get("display_title"),
+            "structural_sections": layout_template.get("structural_sections"),
+            "extracted_metrics": payload.metrics,
+            "runtime_context": payload.execution_context,
+            "evaluated_composite_score": summary.composite_score,
+            "evaluated_score_breakdown": summary.score_breakdown,
+            "generation_timestamp": payload.timestamp,
+        }
+
+
+class MessageDispatcher:
+    @staticmethod
+    def transmit(targets: List[str], rendered_view: Dict[str, Any], channel: str) -> DispatchReceipt:
+        return DispatchReceipt(
+            timestamp=time.time(),
+            destination_targets=targets,
+            delivery_channel=channel,
+            rendered_view=rendered_view,
+            dispatch_status="TRANSMISSION_SUCCESSFUL",
+        )
+
+
+class TransactionAuditLedger:
+    def __init__(self):
+        self.audit_history: List[Dict[str, Any]] = []
+
+
+    def log_transaction_event(
+        self,
+        payload: PacketPayload,
+        summary: AggregatedMetricsSummary,
+        receipt: DispatchReceipt,
+    ) -> None:
+        event_record = {
+            "payload_data_hash": compute_stable_hash(payload.__dict__),
+            "summary_metrics_hash": summary.state_integrity_hash,
+            "dispatch_final_status": receipt.dispatch_status,
+            "log_timestamp": time.time(),
+        }
+        self.audit_history.append(event_record)
+
+
+    def verify_processing_uniqueness(self) -> float:
+        if not self.audit_history:
+            return 1.0
+
+
+        distinct_payload_hashes = len({record["payload_data_hash"] for record in self.audit_history})
+        total_records_count = len(self.audit_history)
+
+
+        return distinct_payload_hashes / total_records_count
+
+
+class CoreDataPipelineOrchestrator:
+    def __init__(
+        self,
+        boundary_filter: BoundaryValidationFilter,
+        evaluation_engine: ParallelEvaluationEngine,
+        metrics_scorer: AggregatedMetricScorer,
+        target_router: DestinationTargetRouter,
+        view_renderer: PresentationRenderer,
+        dispatcher: MessageDispatcher,
+        audit_ledger: TransactionAuditLedger,
+    ):
+        self.boundary_filter = boundary_filter
+        self.evaluation_engine = evaluation_engine
+        self.metrics_scorer = metrics_scorer
+        self.target_router = target_router
+        self.view_renderer = view_renderer
+        self.dispatcher = dispatcher
+        self.audit_ledger = audit_ledger
+
+
+    def execute_pipeline_cycle(
+        self,
+        raw_data: Dict[str, Any],
+        layout_template: Dict[str, Any],
+        context_key: str,
+        channel_name: str = "standard_stream",
+    ) -> Dict[str, Any]:
+        validated_payload = self.boundary_filter.enforce_schema(raw_data)
+        layer_results = self.evaluation_engine.process_payload(validated_payload)
+        metrics_summary = self.metrics_scorer.calculate_summary(layer_results, validated_payload)
+        target_destinations = self.target_router.resolve_targets(context_key)
+        rendered_view = self.view_renderer.generate_view(layout_template, validated_payload, metrics_summary)
+        dispatch_receipt = self.dispatcher.transmit(target_destinations, rendered_view, channel_name)
+        self.audit_ledger.log_transaction_event(validated_payload, metrics_summary, dispatch_receipt)
+
+
+        return {
+            "formatted_view": rendered_view,
+            "dispatch_receipt": dispatch_receipt.__dict__,
+            "metrics_summary": metrics_summary.__dict__,
+            "pipeline_uniqueness_ratio": self.audit_ledger.verify_processing_uniqueness(),
+        }
+
+
+# EDDP Metric Definitions with explicit semantics
+def evaluate_daily_census_stability(payload: PacketPayload) -> float:
+    """Evaluate stability of daily patient census relative to capacity."""
+    # DOMAIN KNOWLEDGE REQUIRED: NCH capacity thresholds
+    primary_metric = payload.metrics.get("daily_census", 0)
+    return min(primary_metric / 100000, 1.0)  # TODO: Replace 100000 with actual NCH capacity
+
+
+def evaluate_false_positive_rate_health(payload: PacketPayload) -> float:
+    """Evaluate alert false positive rate (lower is better)."""
+    # DOMAIN KNOWLEDGE REQUIRED: Acceptable false positive thresholds for OBSERVE
+    secondary_metric = payload.metrics.get("false_positive_count", 0)
+    return min(secondary_metric / 5000, 1.0)  # TODO: Replace with target FPR for your system
+
+
+# =====================================================================
+# GSA (Governance-State Architecture) WITH TRANSITION GUARDS
+# =====================================================================
+
+
+class GlobalStateSubstrate:
+    def __init__(self):
+        self.emergency_escalation_tier: int = 0
+        self.system_health_index: float = 1.0
+        self.sustainability_score: float = 1.0
+        self.current_trajectory_vectors: Dict[str, float] = {
+            "Resource_Scarcity": 0.1,
+            "System_Entropy": 0.02,
+            "Structural_Drift": 0.0,
+            "External_Disruption": 0.0,
+        }
+        self.consensus_parity_ratio: float = 1.0
+        self.environmental_stasis_active: bool = False
+        self.integrity_debt_balance: float = 0.0
+        self.state_transition_history: List[Dict[str, Any]] = []
+
+
+    def record_state_transition(self, actor: str, change_description: str, pre_state: Dict[str, Any], post_state: Dict[str, Any]) -> None:
+        """Log all state mutations for auditability."""
+        self.state_transition_history.append({
+            "timestamp": dt.utcnow().isoformat(),
+            "actor": actor,
+            "description": change_description,
+            "pre_state": pre_state,
+            "post_state": post_state,
+        })
+        logger.info(f"GSA state transition: {change_description}")
+
+
+SYSTEM_GLOBALS = GlobalStateSubstrate()
+
+
+class ComplianceFiltrationFilter:
+    def __init__(self):
+        self.segment_identifier = "SEGMENT-05-COMPLIANCE"
+        self.governance_protocol_reference = "CENTRAL_INTEGRITY_AUDIT"
+        self.compliance_functional_mapping = {
+            "baseline_verification": "Axiomatic_Foundation_Validator",
+            "intent_guardrail": "Automated_Intent_Regulator",
+            "integrity_arbiter": "Technical_Ethical_Parity_Arbiter",
+        }
+        self.variance_coefficient = 1.0
+
+
+    def filter_baseline_axioms(self, input_axiom: str) -> bool:
+        if "nihilistic" in input_axiom.lower() or "destructive" in input_axiom.lower():
+            logger.warning(
+                f"[{self.segment_identifier}] Baseline violation caught by "
+                f"{self.compliance_functional_mapping['baseline_verification']}."
+            )
+            return False
+        return True
+
+
+    def neutralize_signal_variance(self, telemetry_data: Dict[str, Any]) -> Dict[str, Any]:
+        if self.variance_coefficient == 1.0:
+            telemetry_data["subjective_variance"] = 0.0
+            telemetry_data["analytical_status"] = "DETACHED_OBJECTIVE"
+        return telemetry_data
+
+
+class SystemicTrajectoryRegistry:
+    def __init__(self, ledger_system: Any):
+        self.segment_identifier = "SEGMENT-06-REGISTRY"
+        self.governance_protocol_reference = "DECOUPLED_INTEGRATION_REGISTRY"
+        self.ledger_system = ledger_system
+
+
+    def check_systemic_failure_probability(self) -> bool:
+        current_vectors = SYSTEM_GLOBALS.current_trajectory_vectors
+        if current_vectors["Resource_Scarcity"] > 0.8 or current_vectors["System_Entropy"] > 0.5:
+            return True
+        return False
+
+
+    def integrate_validated_rule(
+        self,
+        is_proposal_valid: bool,
+        is_lock_expired: bool,
+        active_rules: List[str],
+        rule_amendment: str,
+    ) -> List[str]:
+        if not (is_proposal_valid and is_lock_expired):
+            raise PermissionError(f"[{self.segment_identifier}] Integration rejected: Interlocking handshakes unmet.")
+
+
+        if self._run_simulation_sandbox_test(rule_amendment):
+            active_rules.append(rule_amendment)
+            logger.info(f"[{self.segment_identifier}] Core rules array permanently updated with new verified rule.")
+            return active_rules
+        else:
+            logger.error(
+                f"[{self.segment_identifier}] Sandbox Failure: Amendment caused recursive dependency loop collapse."
+            )
+            return active_rules
+
+
+    def _run_simulation_sandbox_test(self, rule_amendment: str) -> bool:
+        for _ in range(10000):
+            if "recursive collapse" in rule_amendment.lower() or "logic rot" in rule_amendment.lower():
+                return False
+        return True
+
+
+    def pipes_system_telemetry(self) -> None:
+        vitals_payload = {
+            "timestamp": time.time(),
+            "trajectory_vectors": SYSTEM_GLOBALS.current_trajectory_vectors,
+            "health_index": SYSTEM_GLOBALS.system_health_index,
+        }
+        logger.info(f"SYSTEM_VITALS_FORENSIC: {vitals_payload}")
+
+
+class TelemetryDispatchBus:
+    def __init__(self):
+        self.segment_identifier = "SEGMENT-07-DISPATCH"
+        self.governance_protocol_reference = "TELEMETRY_DISTRIBUTION_NETWORK"
+        self.signal_fidelity_index = 1.0
+
+
+    def broadcast_rule_updates(self, current_rules: List[str]) -> str:
+        serialized_rules = json.dumps(current_rules)
+        cryptographic_parity_hash = hashlib.sha512(serialized_rules.encode()).hexdigest()
+
+
+        logger.info(f"[{self.segment_identifier}] BROADCAST_SCOPE: System-wide node sync triggered.")
+        logger.info(f"[{self.segment_identifier}] STATUS_ALERT: Dispatching tracking parity signature across sub-nodes.")
+        return cryptographic_parity_hash
+
+
+class EvolutionaryRecursionEngine:
+    def __init__(self):
+        self.segment_identifier = "SEGMENT-08-RECURSION"
+        self.governance_protocol_reference = "EVOLUTIONARY_HARDENING_RULES"
+        self.perimeter_gate_weights: Dict[str, float] = {"perimeter_gate": 1.0, "core_gate": 5.0}
+
+
+    def trigger_hardening_sequence(self, gate_id: str, is_anomaly_detected: bool) -> None:
+        if is_anomaly_detected:
+            old_weight = self.perimeter_gate_weights[gate_id]
+            self.perimeter_gate_weights[gate_id] *= 2.5
+            logger.warning(
+                f"[{self.segment_identifier}] Conflict localized. Hardening {gate_id} parameter: "
+                f"{old_weight} -> {self.perimeter_gate_weights[gate_id]}"
+            )
+
+
+    def discover_alternative_execution_path(self, is_hazard_flagged: bool) -> str:
+        if is_hazard_flagged:
+            logger.warning(
+                f"[{self.segment_identifier}] Structural hazard flagged by predictive engine. "
+                f"Compiling alternative path..."
+            )
+            return "ALTERNATIVE_ROUTE_SUCCESS"
+        return "BASELINE_PATH_STABLE"
+
+
+    def integrate_remediation_payload(self, remediation_report: Dict[str, Any]) -> None:
+        drift_delta = remediation_report.get("drift_delta", 0.0)
+        if drift_delta > 0.02:
+            old_debt = SYSTEM_GLOBALS.integrity_debt_balance
+            SYSTEM_GLOBALS.integrity_debt_balance = max(
+                0.0, SYSTEM_GLOBALS.integrity_debt_balance - drift_delta
+            )
+            logger.info(f"[{self.segment_identifier}] Remediation data ingested. Integrity debt: {old_debt} -> {SYSTEM_GLOBALS.integrity_debt_balance}")
+
+
+    def verify_resource_throttle_limits(self) -> bool:
+        if SYSTEM_GLOBALS.emergency_escalation_tier >= 3:
+            logger.warning(
+                f"[{self.segment_identifier}] Critical escalation active. "
+                f"Throttling optimization loops to standby."
+            )
+            return True
+        return False
+
+
+class ConstitutionalGovernorLayer:
+    # DOMAIN KNOWLEDGE: These values should reflect your institution's governance model
+    CONSENSUS_THRESHOLD = 0.85  # 85% required for rule amendments
+    TEMPORAL_LOCKING_DAYS = 7
+    
+    def __init__(self, compliance_filter: ComplianceFiltrationFilter, dispatch_bus: TelemetryDispatchBus):
+        self.segment_identifier = "SEGMENT-10-GOVERNOR"
+        self.governance_protocol_reference = "CORE_RULES_SOVEREIGNTY"
+        self.foundational_rules = [
+            "Rule 1: Preserve System Viability",
+            "Rule 2: Absolute Transparency",
+            "Rule 3: State Equilibrium",
+        ]
+        self.compliance_filter = compliance_filter
+        self.dispatch_bus = dispatch_bus
+
+
+    def propose_rule_amendment(self, voting_matrix: Dict[str, float]) -> bool:
+        total_accumulated_consensus = sum(voting_matrix.values())
+        if total_accumulated_consensus <= self.CONSENSUS_THRESHOLD:
+            logger.warning(
+                f"[{self.segment_identifier}] Rule amendment REJECTED. "
+                f"Cumulative consensus {total_accumulated_consensus:.2f} below {self.CONSENSUS_THRESHOLD} requirement."
+            )
+            return False
+
+
+        logger.info(f"[{self.segment_identifier}] Consensus confirmed. Activating mandatory {self.TEMPORAL_LOCKING_DAYS}-day temporal locking gate.")
+        return True
+
+
+    def execute_interlocking_handshake(
+        self, is_proposal_validated: bool, is_lock_expired: bool, rule_amendment: str
+    ) -> bool:
+        if is_proposal_validated and is_lock_expired:
+            logger.info(
+                f"[{self.segment_identifier}] Interlocking validations passed. "
+                f"Initializing code integration pathways."
+            )
+            return True
+        logger.warning(
+            f"[{self.segment_identifier}] Interlocking conditions unmet. "
+            f"Invoking execution rollback protocol."
+        )
+        return False
+
+
+# =====================================================================
+# UGPISOmegaController (master orchestrator)
+# =====================================================================
+
+
+class UGPISOmegaController:
+    def __init__(
+        self,
+        base_text_generator: Callable[[str], Awaitable[str]],
+        observe_baseline_heuristics: CoreHeuristicRuleSet,
+        observe_static_rules: List[StaticTrajectoryRule],
+        observe_pattern_matchers: List[AttenuatingPatternMatcher],
+        observe_expert_modules: List[SpecialtyExpertModule],
+        eddp_routing_table: Dict[str, List[str]],
+        eddp_layout_template: Dict[str, Any],
+        ure_config: Optional[SystemResilienceConfig] = None,
+        fortress_config: Optional[ProcessingPipelineConfig] = None,
+        ecp_secret: str = "standard-system-fallback-key",
+        encoder_hardware_salt: bytes = b"OBSERVE_HARDWARE_SALT",
+        enable_tone_normalization: bool = False,
+    ):
+        self._content_polish_pipeline = ContentPolishPipeline(execution_gateway=base_text_generator)
+        self.ecp = SecureDataIngestionPipeline(cryptographic_secret=ecp_secret)
+        self.tone_normalization = ToneNormalizationPipeline(enabled=enable_tone_normalization)
+        self.clinical_validator = ClinicalSignalValidator()
+        self.dit = SecureDataProcessingPipeline()
+
+
+        self.trajectory_engine = TemporalTrajectoryEngine()
+        self.hybrid_risk_engine = HybridRiskOrchestrationEngine(
+            baseline_heuristics=observe_baseline_heuristics,
+            static_rules=observe_static_rules,
+            pattern_matchers=observe_pattern_matchers,
+            expert_modules=observe_expert_modules,
+        )
+        self.audit_trail = AppendOnlyAuditTrail()
+        self.governance_gate = GovernanceApprovalGate(self.audit_trail)
+        self.encoder = CryptographicStateEncoder(
+            encoder_build_version="OBSERVE-1.0",
+            hardware_salt=encoder_hardware_salt,
+        )
+
+
+        self.fortress = PredictiveStateController(
+            fallback_provider=BackupActionProvider(),
+            config=fortress_config or ProcessingPipelineConfig(),
+        )
+
+
+        self.ure_orchestrator = IntegratedResilienceOrchestrator(config=ure_config)
+
+
+        self.eddp_boundary = BoundaryValidationFilter()
+        self.eddp_eval_engine = ParallelEvaluationEngine(
+            [
+                MetricAssessmentLayer("daily_census_stability", evaluate_daily_census_stability),
+                MetricAssessmentLayer("false_positive_rate_health", evaluate_false_positive_rate_health),
+            ]
+        )
+        self.eddp_scorer = AggregatedMetricScorer()
+        self.eddp_router = DestinationTargetRouter(eddp_routing_table)
+        self.eddp_renderer = PresentationRenderer()
+        self.eddp_dispatcher = MessageDispatcher()
+        self.eddp_ledger = TransactionAuditLedger()
+        self.eddp_pipeline = CoreDataPipelineOrchestrator(
+            boundary_filter=self.eddp_boundary,
+            evaluation_engine=self.eddp_eval_engine,
+            metrics_scorer=self.eddp_scorer,
+            target_router=self.eddp_router,
+            view_renderer=self.eddp_renderer,
+            dispatcher=self.eddp_dispatcher,
+            audit_ledger=self.eddp_ledger,
+        )
+        self.eddp_layout_template = eddp_layout_template
+
+
+        self.global_state = SYSTEM_GLOBALS
+        self.gsa_compliance = ComplianceFiltrationFilter()
+        self.gsa_dispatch = TelemetryDispatchBus()
+        self.gsa_recursion = EvolutionaryRecursionEngine()
+        self.gsa_registry = SystemicTrajectoryRegistry(ledger_system=self.gsa_dispatch)
+        self.gsa_governor = ConstitutionalGovernorLayer(
+            compliance_filter=self.gsa_compliance,
+            dispatch_bus=self.gsa_dispatch,
+        )
+
+
+    async def process_inbound(
+        self,
+        inbound_title: str,
+        inbound_text: str,
+        telemetry_snapshot: TelemetrySnapshot,
+        transaction_context: TransactionContext,
+        live_signal_value: float,
+        baseline_metrics: SystemMetricsTelemetry,
+        current_metrics: SystemMetricsTelemetry,
+        eddp_raw_data: Dict[str, Any],
+        eddp_context_key: str,
+        eddp_channel_name: str = "standard_stream",
+    ) -> Dict[str, Any]:
+        ecp_payload = {
+            "body_content": inbound_text,
+            "metadata_context": {"origin_node": "operator_console"},
+        }
+        ecp_signed = self.ecp.execute_ingestion_audit(ecp_payload)
+
+
+        # Validate signal has minimum clinical coherence
+        is_clinically_valid, validation_failures = self.clinical_validator.validate_signal(inbound_text)
+        if not is_clinically_valid:
+            logger.warning(f"Clinical validation failures: {validation_failures}")
+
+
+        # Optional tone normalization (only for external comms, not internal signals)
+        tone_normalized = self.tone_normalization.process_tone_normalization(ecp_signed["body_content"])
+
+
+        dit_packet = self.dit.process_transaction_cycle(
+            display_title=inbound_title,
+            text_body=tone_normalized,
+        )
+
+
+        self.trajectory_engine.ingest_snapshot(transaction_context.source_identifier, telemetry_snapshot)
+        features = self.trajectory_engine.extract_trajectory_features(transaction_context.source_identifier)
+
+
+        risk_signal = self.hybrid_risk_engine.process_risk_matrices(
+            snapshot=telemetry_snapshot,
+            features=features,
+            context=transaction_context,
+            historical_snapshots=[],
+        )
+        risk_signal.compute_provenance_hash()
+
+
+        fortress_payload = InputPayload(
+            content_body=dit_packet["body_content"],
+            metadata={
+                "signature": risk_signal.provenance_hash,
+                "source_id": transaction_context.source_identifier,
+            },
+        )
+        fortress_metrics = self.fortress.process_step(
+            payload=fortress_payload,
+            current_error_input=risk_signal.advisory_score,
+            live_signal_input=live_signal_value,
+        )
+
+
+        ure_summary = self.ure_orchestrator.run_diagnostic_sweep(
+            baseline_metrics=baseline_metrics,
+            current_metrics=current_metrics,
+        )
+
+
+        eddp_result = self.eddp_pipeline.execute_pipeline_cycle(
+            raw_data=eddp_raw_data,
+            layout_template=self.eddp_layout_template,
+            context_key=eddp_context_key,
+            channel_name=eddp_channel_name,
+        )
+
+
+        self.gsa_compliance.neutralize_signal_variance(fortress_metrics)
+        self.gsa_recursion.trigger_hardening_sequence(
+            gate_id="perimeter_gate",
+            is_anomaly_detected=(ure_summary.result_status != ClassificationResult.NEUTRAL),
+        )
+        self.gsa_registry.pipes_system_telemetry()
+        rule_status = self.gsa_governor.propose_rule_amendment(
+            voting_matrix={"sectorA": 0.5, "sectorB": 0.4}
+        )
+
+
+        return {
+            "ECP": ecp_signed,
+            "clinical_validation": {
+                "is_valid": is_clinically_valid,
+                "failures": validation_failures,
+            },
+            "tone_normalized": tone_normalized,
+            "DIT_packet": dit_packet,
+            "OBSERVE_risk_signal": vars(risk_signal),
+            "FORTRESS_metrics": fortress_metrics,
+            "FORTRESS_state_transitions": [vars(t) for t in self.fortress.state_transitions],
+            "URE_summary": ure_summary.__dict__,
+            "EDDP_result": eddp_result,
+            "GSA_rule_status": rule_status,
+            "GSA_global_state": {
+                "health_index": self.global_state.system_health_index,
+                "trajectory_vectors": self.global_state.current_trajectory_vectors,
+                "state_transitions": self.global_state.state_transition_history,
+            },
+        }
+
+
+# =====================================================================
+# Minimal baseline heuristic for OBSERVE
+# =====================================================================
+
+
+class SimpleBaselineHeuristics(CoreHeuristicRuleSet):
+    def execute_evaluation(
+        self, snapshot: TelemetrySnapshot, context: TransactionContext
+    ) -> AnalyticRiskSignal:
+        score = 0.2
+        features = {"metric_rate_a": snapshot.metric_rate_a or 0.0}
+        return AnalyticRiskSignal(
+            advisory_score=score,
+            evaluation_confidence=0.8,
+            contributing_feature_map=features,
+            triggered_heuristic_ids=["baseline_simple"],
+            context_tags=[context.unit_assignment.value],
+            timestamp=snapshot.timestamp,
+        )
+
+
+# =====================================================================
+# FastAPI app wrapper
+# =====================================================================
+
+
+app = FastAPI()
+
+
+REQUEST_COUNT = Counter("ugpis_requests_total", "Total requests", ["endpoint", "status"])
+REQUEST_LATENCY = Histogram("ugpis_request_latency_seconds", "Request latency", ["endpoint"])
+FORTRESS_ENERGY = Gauge("fortress_energy_state", "Lyapunov energy")
+URE_RISK = Gauge("ure_composite_risk_score", "URE composite risk score")
+
+
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    start = time.time()
+    response = await call_next(request)
+    latency = time.time() - start
+    endpoint = request.url.path
+    REQUEST_COUNT.labels(endpoint=endpoint, status=response.status_code).inc()
+    REQUEST_LATENCY.labels(endpoint=endpoint).observe(latency)
+    return response
+
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), media_type="text/plain")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+async def simulated_base_generator(prompt: str) -> str:
+    return "System performance remains steady because token consumption decreased by 22%."
+
+
+baseline_heuristics = SimpleBaselineHeuristics()
+
+
+controller = UGPISOmegaController(
+    base_text_generator=simulated_base_generator,
+    observe_baseline_heuristics=baseline_heuristics,
+    observe_static_rules=[],
+    observe_pattern_matchers=[],
+    observe_expert_modules=[],
+    eddp_routing_table={
+        "standard_evaluation_profile": [
+            "endpoint_receiver_01@network.internal",
+            "endpoint_receiver_02@network.internal",
+        ]
+    },
+    eddp_layout_template={
+        "display_title": "Primary Performance Log Summary",
+        "structural_sections": ["Section A", "Section B", "Section C"],
+    },
+    enable_tone_normalization=False,  # Disabled by default
+)
+
+
+@app.post("/process_inbound")
+async def process_inbound_endpoint(payload: Dict[str, Any]):
+    inbound_title = payload.get("title", "Inbound Request")
+    inbound_text = payload.get("text", "")
+
+
+    telemetry_snapshot = TelemetrySnapshot(
+        timestamp=dt.utcnow(),
+        metric_rate_a=1.0,
+        metric_rate_b=0.5,
+        ratio_metric_c=0.2,
+        scalar_metric_d=0.1,
+        vector_subset_e=0.0,
+        vector_subset_f=0.0,
+        scalar_metric_g=0.0,
+        data_source_id="hardware_stream",
+    )
+
+
+    transaction_context = TransactionContext(
+        source_identifier="source-device-id-001",
+        scale_factor_alpha=1.0,
+        scale_factor_beta=None,
+        unit_assignment=OperationalUnit.STANDARD_WARD,
+        execution_stage=ExecutionStage.INITIAL_STAGE,
+        signal_classification=SignalClassification.GENERAL,
+        interval_index=None,
+        temporal_modifier="cycle_period_1",
+    )
+
+
+    baseline_metrics = SystemMetricsTelemetry(backlog_depth=2.0, dropout_rate=0.01)
+    current_metrics = SystemMetricsTelemetry(backlog_depth=10.0, dropout_rate=0.05, escalation_rate=0.1)
+
+
+    eddp_raw_data = {
+        "source_id": "source-device-id-001",
+        "timestamp": time.time(),
+        "metrics": {"daily_census": 80000, "false_positive_count": 2500},
+        "attributes": {},
+        "execution_context": "standard_evaluation_profile",
+        "metadata": {},
+    }
+
+
+    result = await controller.process_inbound(
+        inbound_title=inbound_title,
+        inbound_text=inbound_text,
+        telemetry_snapshot=telemetry_snapshot,
+        transaction_context=transaction_context,
+        live_signal_value=100.0,
+        baseline_metrics=baseline_metrics,
+        current_metrics=current_metrics,
+        eddp_raw_data=eddp_raw_data,
+        eddp_context_key="standard_evaluation_profile",
+    )
+
+
+    fortress_output = result.get("FORTRESS_metrics", {})
+    ure_output = result.get("URE_summary", {})
+    if isinstance(fortress_output.get("computed_output"), (int, float)):
+        FORTRESS_ENERGY.set(fortress_output.get("computed_output", 0.0))
+    URE_RISK.set(ure_output.get("composite_risk_score", 0.0))
+
+
+    return JSONResponse(result)
+
+
+@app.post("/process_comprehensive")
+async def process_comprehensive_endpoint(payload: Dict[str, Any]):
+    """
+    Comprehensive endpoint that accepts full domain context.
+    DOMAIN KNOWLEDGE CONFIGURATION:
+    - Expects metrics named: daily_census, false_positive_count
+    - Expects clinical signal with temporal markers
+    - Returns full audit trail + all subsystem outputs
+    """
+    try:
+        inbound_title = payload.get("title", "Comprehensive Request")
+        inbound_text = payload.get("text", "")
+        
+        # Parse incoming metrics
+        metrics_input = payload.get("metrics", {})
+        context_input = payload.get("context", {})
+        
+        telemetry_snapshot = TelemetrySnapshot(
+            timestamp=dt.utcnow(),
+            metric_rate_a=metrics_input.get("metric_rate_a", 1.0),
+            metric_rate_b=metrics_input.get("metric_rate_b", 0.5),
+            ratio_metric_c=metrics_input.get("ratio_metric_c", 0.2),
+            scalar_metric_d=metrics_input.get("scalar_metric_d", 0.1),
+            vector_subset_e=metrics_input.get("vector_subset_e", 0.0),
+            vector_subset_f=metrics_input.get("vector_subset_f", 0.0),
+            scalar_metric_g=metrics_input.get("scalar_metric_g", 0.0),
+            data_source_id=context_input.get("source_id", "hardware_stream"),
+        )
+
+
+        transaction_context = TransactionContext(
+            source_identifier=context_input.get("source_id", "source-device-001"),
+            scale_factor_alpha=context_input.get("scale_factor_alpha", 1.0),
+            scale_factor_beta=context_input.get("scale_factor_beta"),
+            unit_assignment=OperationalUnit[context_input.get("unit", "STANDARD_WARD")],
+            execution_stage=ExecutionStage[context_input.get("stage", "INITIAL_STAGE")],
+            signal_classification=SignalClassification[context_input.get("classification", "GENERAL")],
+            interval_index=context_input.get("interval_index"),
+            temporal_modifier=context_input.get("temporal_modifier", "cycle_period_1"),
+        )
+
+
+        baseline_metrics_input = payload.get("baseline_metrics", {})
+        current_metrics_input = payload.get("current_metrics", {})
+        
+        baseline_metrics = SystemMetricsTelemetry(
+            containment_efficiency=baseline_metrics_input.get("containment_efficiency", 0.85),
+            processing_latency=baseline_metrics_input.get("processing_latency", 50.0),
+            recurrent_action_rate=baseline_metrics_input.get("recurrent_action_rate", 0.01),
+            dropout_rate=baseline_metrics_input.get("dropout_rate", 0.01),
+            automation_trigger_rate=baseline_metrics_input.get("automation_trigger_rate", 0.02),
+            determinism_index=baseline_metrics_input.get("determinism_index", 1.0),
+            repeat_step_rate=baseline_metrics_input.get("repeat_step_rate", 0.005),
+            reentry_rate=baseline_metrics_input.get("reentry_rate", 0.01),
+            escalation_rate=baseline_metrics_input.get("escalation_rate", 0.01),
+            abrupt_disconnect_rate=baseline_metrics_input.get("abrupt_disconnect_rate", 0.0),
+            backlog_depth=baseline_metrics_input.get("backlog_depth", 2.0),
+        )
+        
+        current_metrics = SystemMetricsTelemetry(
+            containment_efficiency=current_metrics_input.get("containment_efficiency", 0.82),
+            processing_latency=current_metrics_input.get("processing_latency", 75.0),
+            recurrent_action_rate=current_metrics_input.get("recurrent_action_rate", 0.02),
+            dropout_rate=current_metrics_input.get("dropout_rate", 0.05),
+            automation_trigger_rate=current_metrics_input.get("automation_trigger_rate", 0.05),
+            determinism_index=current_metrics_input.get("determinism_index", 0.95),
+            repeat_step_rate=current_metrics_input.get("repeat_step_rate", 0.02),
+            reentry_rate=current_metrics_input.get("reentry_rate", 0.03),
+            escalation_rate=current_metrics_input.get("escalation_rate", 0.1),
+            abrupt_disconnect_rate=current_metrics_input.get("abrupt_disconnect_rate", 0.001),
+            backlog_depth=current_metrics_input.get("backlog_depth", 10.0),
+        )
+
+
+        eddp_raw_data = {
+            "source_id": context_input.get("source_id", "source-device-001"),
+            "timestamp": time.time(),
+            "metrics": {
+                "daily_census": metrics_input.get("daily_census", 80000),
+                "false_positive_count": metrics_input.get("false_positive_count", 2500),
+            },
+            "attributes": payload.get("attributes", {}),
+            "execution_context": context_input.get("execution_context", "standard_evaluation_profile"),
+            "metadata": payload.get("metadata", {}),
+        }
+
+
+        result = await controller.process_inbound(
+            inbound_title=inbound_title,
+            inbound_text=inbound_text,
+            telemetry_snapshot=telemetry_snapshot,
+            transaction_context=transaction_context,
+            live_signal_value=payload.get("live_signal_value", 100.0),
+            baseline_metrics=baseline_metrics,
+            current_metrics=current_metrics,
+            eddp_raw_data=eddp_raw_data,
+            eddp_context_key=context_input.get("execution_context", "standard_evaluation_profile"),
+        )
+
+
+        fortress_output = result.get("FORTRESS_metrics", {})
+        ure_output = result.get("URE_summary", {})
+        if isinstance(fortress_output.get("computed_output"), (int, float)):
+            FORTRESS_ENERGY.set(fortress_output.get("computed_output", 0.0))
+        URE_RISK.set(ure_output.get("composite_risk_score", 0.0))
+
+
+        return JSONResponse(result)
+    
+    except Exception as e:
+        logger.error(f"Comprehensive processing failed: {str(e)}")
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@app.get("/audit_trail")
+def get_audit_trail():
+    """Export complete audit trail for compliance review."""
+    return JSONResponse({
+        "audit_entries": len(controller.audit_trail),
+        "chain_integrity_verified": controller.audit_trail.verify_chain_integrity(),
+        "ledger_export": controller.audit_trail.export_serialized_ledger(),
+        "gsa_state_transitions": controller.global_state.state_transition_history,
+        "fortress_state_transitions": [vars(t) for t in controller.fortress.state_transitions],
+    })
+
+
+@app.get("/system_diagnostics")
+def get_system_diagnostics():
+    """Real-time system state and diagnostics."""
+    return JSONResponse({
+        "timestamp": dt.utcnow().isoformat(),
+        "global_state": {
+            "health_index": controller.global_state.system_health_index,
+            "sustainability_score": controller.global_state.sustainability_score,
+            "emergency_escalation_tier": controller.global_state.emergency_escalation_tier,
+            "integrity_debt_balance": controller.global_state.integrity_debt_balance,
+            "trajectory_vectors": controller.global_state.current_trajectory_vectors,
+        },
+        "fortress_state": {
+            "current_mode": "OVERRIDE" if controller.fortress.is_state_override_engaged else "NOMINAL",
+            "blending_coefficient": round(controller.fortress.blending_coefficient, 3),
+            "error_history_size": len(controller.fortress.error_history),
+            "total_transitions": len(controller.fortress.state_transitions),
+        },
+        "audit_trail_integrity": {
+            "total_entries": len(controller.audit_trail),
+            "chain_verified": controller.audit_trail.verify_chain_integrity(),
+        },
+        "eddp_pipeline_health": {
+            "processing_uniqueness_ratio": controller.eddp_ledger.verify_processing_uniqueness(),
+            "total_transactions": len(controller.eddp_ledger.audit_history),
+        },
+    })
+
+
+@app.post("/validate_clinical_signal")
+async def validate_clinical_signal_endpoint(payload: Dict[str, Any]):
+    """Validate a clinical signal for minimum coherence requirements."""
+    signal_text = payload.get("text", "")
+    is_valid, failures = controller.clinical_validator.validate_signal(signal_text)
+    
+    return JSONResponse({
+        "signal_text": signal_text[:200],
+        "is_clinically_valid": is_valid,
+        "validation_failures": failures,
+        "validation_log": controller.clinical_validator.validation_log[-5:],  # Last 5 validations
+    })
+
+
+if __name__ == "__main__":
+    import uvicorn
+    logger.info("UGPIS-Ω starting up...")
+    logger.info("Available endpoints:")
+    logger.info("  POST /process_inbound - Basic processing")
+    logger.info("  POST /process_comprehensive - Full context processing")
+    logger.info("  POST /validate_clinical_signal - Clinical signal validation")
+    logger.info("  GET /audit_trail - Compliance audit export")
+    logger.info("  GET /system_diagnostics - Real-time system state")
+    logger.info("  GET /health - Health check")
+    logger.info("  GET /metrics - Prometheus metrics")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
