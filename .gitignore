@@ -1,0 +1,55 @@
+# Large binaries and archives
+*.pdf
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+*.exe
+*.dll
+*.so
+*.bin
+
+# Media
+*.mp4
+*.mov
+*.mp3
+*.wav
+*.avi
+*.mkv
+*.jpg
+*.jpeg
+*.png
+*.gif
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv/
+venv/
+pdf_tools_env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Takeout/export folders
+Takeout/
+"Takeout"/
+
+# archives and bundles
+*.tar.bz2
+*.gz
+
+# logs and temporary
+*.log
+*.tmp
+*.cache
+
