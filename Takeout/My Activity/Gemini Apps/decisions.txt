@@ -1,0 +1,257 @@
+# Sentinel — Decisions Log
+
+An append-only record of significant build decisions: the context, the decision,
+and the reasoning — including reversals and bugs, because the path (including the
+wrong turns) is part of what a future session needs to understand.
+
+Format per entry: **context → decision → why**, plus **status**.
+
+---
+
+## ADR-001 — Build the harness before the diagnostic engine
+**Context.** The build brief's §6 lists the diagnostic engine before the synthetic
+harness. **Decision.** Reverse it: build the causally-wired harness first.
+**Why.** You cannot honestly build or prove a diagnostic engine without data where
+the emotion→structure→outcome relationship is real and *known*. Prior rule-clean
+data showed nothing because routing was correct by construction. The harness plants
+a known truth so "the engine found X" can be checked against "X is what we planted."
+**Status.** Locked. Harness built first.
+
+## ADR-002 — Scope this session to the foundation only
+**Context.** The brief says "the best system you've ever built," which tempts toward
+building all four pipeline stages to look complete. **Decision.** Build two
+foundational components fully (harness now; routing-graph core is embedded in the
+harness as `ivr_tree.py`), test and document them, and stop. **Why.** One true,
+tested, documented thing beats a four-stage skeleton that validates nothing. The
+"best" and "honest" requirements are the same; an impressive-looking hollow shell
+violates the honesty spine. **Status.** Locked.
+
+## ADR-003 — The IVR tree is a mutable, clone-able structure
+**Context.** The core intervention is re-sequencing the menu. **Decision.** Model
+the tree as nodes with **ordered** option lists, with `clone()` and
+`reorder_menu()` / `move_option_to_end()` as first-class operations.
+**Why.** "Re-arrange the menu and measure the change" requires the tree to be a
+thing you can vary from the start, and the variation must not mutate the original
+(so the simulator can compare current-vs-variant on the same population and
+attribute the difference to structure). Hard-coding the flow would force a rebuild
+later. **Status.** Locked. `ivr_tree.py` is the shared spine the future simulator
+will reuse.
+
+## ADR-004 — Emotion is a trajectory, not a fixed attribute
+**Context.** Whether sequence can matter at all depends on this. **Decision.** Give
+each caller a `temperature` that evolves at every node (heat from effort, irrelevant
+menus, failed self-serve, dead-air dips, auth loops; cooling from resolution and
+early acknowledgment), and let temperature drive the next decision.
+**Why.** If emotion were a fixed stamp, the order of nodes would be irrelevant and
+the whole thesis would collapse. The trajectory is the mechanism by which sequence
+becomes consequence. **Status.** Locked. Verified: cool callers contain ~46%, hot
+~29% through the identical tree.
+
+## ADR-005 — Disposition is hidden; observed attributes only correlate with it
+**Context.** The diagnostic engine must reverse-engineer, not cheat. **Decision.**
+Each caller has a hidden `Disposition` (patience, base_temperature, self-serve
+affinity); the `observed()` view exposes only attributes (age, product, tenure,
+channel, reason…) that *correlate* with disposition through documented rules.
+**Why.** A real engagement sees who a caller is, not why they behave as they do. If
+the harness leaked a `will_contain` flag, the engine would prove nothing. The
+correlation-not-identity structure forces genuine reverse-engineering.
+**Status.** Locked. Test `test_disposition_is_hidden_from_observed` enforces it.
+
+## ADR-006 — BUG FOUND & FIXED: fake containment was structurally unreachable
+**Context.** First harness run showed **0.0% fake containment** despite self-serve
+nodes having `resolve_prob < 1`. **Diagnosis.** Every unresolved self-serve had
+`next_on_fail="agent"`, so all 707 failures routed to an agent; the
+`CONTAINED_UNRESOLVED` outcome could never fire. The route-intent-vs-outcome gap —
+the core lie the system exists to catch — did not exist in the data.
+**Fix.** Added terminal "we've handled it, goodbye" self-serve nodes
+(`tech_confirm`, `new_service_info`) with `resolve_prob=0.0` and `next_on_fail=None`,
+so some unresolved callers leave automation "handled" but unresolved.
+**Result.** Fake containment now 7.5%; containment (40%) visibly exceeds true
+resolution (32.5%). **Why it matters.** Without this the harness was a faithful
+world *missing the one phenomenon the product is about*. Caught by checking the
+outcome distribution rather than trusting the top-line number. **Status.** Fixed
+and locked by `test_fake_containment_actually_occurs`.
+
+## ADR-007 — BUG FOUND & FIXED: hang-ups were unrealistically near zero
+**Context.** First run showed 0.1% hang-ups — real IVRs lose people to impatience.
+**Diagnosis.** The patience-pressure scale (`effort * 0.05`) was far too small
+relative to patience, so accumulated effort never threatened anyone's tolerance.
+**Fix.** Recalibrated to `effort * 0.18` and shrank effective patience with
+temperature, so ~3–6 steps starts to matter for low-patience hot callers.
+**Result.** Hang-ups now ~4%, a believable level. **Status.** Fixed. (Note: the
+scale is illustrative, not validated against real abandonment curves.)
+
+## ADR-008 — Protected attribute is causally inert by default, plantable on demand
+**Context.** The fairness boundary is absolute. **Decision.** The protected-style
+marker has **no** effect on disposition by default; `plant_protected_bias=True`
+injects a real identity-linked disparity. **Why.** The future fairness auditor must
+be testable two ways: it should find *nothing* when there is no identity-driven
+pattern (no false alarm), and it should *catch* a planted disparity. The harness can
+create the disease on purpose so the auditor is provable; it never ships the disease
+on by default. This mirrors the absolute rule: optimize on behavior/context, never
+on protected identity. **Status.** Locked by two tests (no-effect-by-default;
+detectable-when-planted).
+
+## ADR-009 — Determinism per (population, tree, seed)
+**Context.** The simulator compares two trees on one population. **Decision.** Each
+caller gets a private RNG derived from seed + caller_id; same caller behaves
+identically across tree variants. **Why.** Any difference between two trees must be
+attributable to *structure*, not RNG noise, or the simulator's measurement is
+meaningless. **Status.** Locked by `test_traversal_is_deterministic`.
+
+## ADR-010 — Effect sizes kept modest and honest
+**Context.** A single menu re-order produced ~1.6 points of containment lift.
+**Decision.** Leave it; do not tune the harness to produce dramatic numbers.
+**Why.** One menu change should not be a miracle. A harness that yielded +20% from
+one tweak would be dishonest and would set false expectations for real engagements.
+The larger lifts are the simulator's job to find via emotion-conditioned, multi-node
+re-sequencing. The believable small effect is a feature, not a shortfall.
+**Status.** Locked. Documented in the README's "honest note on effect size."
+
+---
+
+## ADR-011 — Diagnostic engine finds; it does not prescribe
+**Context.** Building the diagnostic engine, the temptation is to have it also say
+"re-sequence this menu." **Decision.** The diagnostic finds and DESCRIBES leaks
+only; prescription is a later layer. **Why.** "I found a problem" and "here is the
+fix" are different jobs with different evidentiary bars — the fix requires
+whole-population simulation to avoid the "+10% on 25%, but 5% now agent-only"
+landmine. Letting the diagnostic prescribe would be over-reach. The boundary keeps
+each component honest. **Status.** Locked.
+
+## ADR-012 — Two-tier hybrid: trust level is STRUCTURAL (distinct types)
+**Context.** Choosing between a transparent scan (legible, limited) and a tree
+discovery (powerful, ghost-prone). **Decision.** Do both, but make `Finding`
+(scan) and `Candidate` (tree) DIFFERENT TYPES, not one object with a flag.
+**Why.** Blending the two into one list mixes the tree's ghosts with the scan's
+solid ground and loses the ability to tell them apart — worse than either alone.
+Distinct types make the trust level un-confusable; you cannot hand a client a
+Candidate thinking it is a Finding. **Status.** Locked. `diagnostic_types.py`.
+
+## ADR-013 — Tree discovery is a transparent recursive split, not a black box
+**Context.** Tier 2 needs to find deep interactions. **Decision.** Use a simple
+recursive split on "did the caller contain," producing readable attribute=value
+paths — not an ML model. **Why.** A black-box model surfacing unexplainable
+segments would itself violate the honesty discipline ("the model says so" is not
+something you put in front of a client). Legible candidates can at least be
+reasoned about. Also keeps the engine stdlib-light. **Status.** Locked.
+
+## ADR-014 — BUG FOUND & FIXED: the engine was blind to disparate impact
+**Context.** With a deliberately planted protected disparity, the first version of
+the fairness pass raised ZERO flags. **Diagnosis.** The engine scanned only
+behavioral keys (correctly excluding protected attributes from OPTIMIZATION), but
+that meant it never LOOKED at protected attributes at all — so it could not detect
+a real disparity on them. An auditor blind to disparate impact cannot audit for it.
+**Fix.** Added a separate disparate-impact scan that measures containment AND
+live-agent access across each protected attribute's groups and flags material
+adverse gaps — without ever making them optimization targets. **Why it matters.**
+Excluding protected attributes from optimization and detecting inequity in them are
+DIFFERENT requirements; the system must do both. Detecting disparate impact is the
+opposite of creating it. **Result.** Now catches a planted disparity (protected
+group: worse containment AND -12pt agent access) and stays silent when none is
+planted (no false alarm). **Status.** Fixed; locked by two tests.
+
+## ADR-015 — Cross-check candidates against the scan as a cheap ghost filter
+**Context.** Tree candidates are ghost-prone and the real validation Partner does
+not exist yet. **Decision.** Each candidate records whether the transparent scan
+corroborates its driving attributes; uncorroborated candidates are explicitly
+labeled higher ghost risk. **Why.** Even before the Partner, the two methods
+cross-validating each other is a cheap, honest first filter: agreement is mild
+evidence of reality, a tree-only pattern the scan sees no trace of is a flag.
+**Status.** Locked.
+
+## ADR-016 — Tree threshold tuned to surface corroborated candidates, not ghosts
+**Context.** At strict thresholds Tier 2 found 0 candidates; relaxed, it found 35
+that were mostly the strong fraud effect sliced by an inert attribute (region) into
+noisy subgroups — i.e. ghosts. **Decision.** Set `tree_min_leaf=100` as the
+default, which surfaces a small number of scan-corroborated candidates while
+suppressing the region-sliced ghosts. **Why.** The default should demonstrate the
+tier honestly: a few plausible leads, every one carrying its ghost-risk label and
+needing Partner validation — not a flood of noise dressed as discovery. The 0-vs-35
+behavior at the extremes is itself documented as honest (single-attribute planted
+effects mean deep real interactions are genuinely rare). **Status.** Locked.
+
+---
+
+## ADR-017 — Simulator: the distribution is first-class, harm sits beside the net
+**Context.** Building the whole-population simulator, the easy design reports a net
+containment delta. **Decision.** Make the per-segment effect distribution a
+first-class field on the result, with `harmful_segments` and `worst_harm` sitting
+right next to `net_containment_delta`. **Why.** The entire danger is a change with
+a good average and a brutal minority hit ("+10% on 25%, but 5% now agent-only"). If
+the harm is a drill-down rather than top-level, it hides. Surfacing it beside the
+headline means a reader who sees only the net still cannot miss the harm.
+**Status.** Locked. `simulation_types.py`.
+
+## ADR-018 — Every effect measured on containment AND true resolution
+**Context.** A change can raise containment by raising FAKE containment (trapping
+callers in unresolved self-service). **Decision.** Measure and report both, and
+make a fake-containment-driven gain a distinct verdict (FALSE WIN). **Why.**
+Watching only top-line containment rewards exactly the wrong thing; the most
+seductive bad change is one that strands callers while the headline number climbs.
+Verified: a dispute-to-dead-end change shows +6.8pt containment but +3.5pt fake,
+correctly called a FALSE WIN rather than an improvement. **Status.** Locked.
+
+## ADR-019 — Simulator MEASURES proposed changes; it does not SEARCH for them
+**Context.** The tempting next step is an optimizer that searches re-sequencings for
+the best one. **Decision.** Build honest measurement of human-proposed changes
+first; defer auto-search. **Why.** An optimizer chasing a net number is precisely
+the mechanism that FINDS the landmine change — the one that looks great on average
+and harms a segment. Auto-search is only safe once the validation Partner and hard
+distributional harm-constraints exist. Measurement of proposed changes is
+unambiguously useful and safe now. **Status.** Deferred by design; measurement
+shipped.
+
+## ADR-020 — A clean win is a conjunction; a change must clone the tree
+**Context.** Defining what counts as a safe improvement, and protecting the
+comparison. **Decision.** `is_clean_win` requires net containment up AND net true
+resolution up AND fake not materially up AND no segment harmed. Separately, a
+change that does not return a modified clone (i.e. would mutate the baseline) is
+rejected. **Why.** The conjunction prevents a net gain with a harmed segment from
+being mislabeled clean. The clone requirement protects the controlled comparison:
+if the baseline were mutated in place, the measured delta would be meaningless.
+**Status.** Locked by tests (net-gain-with-harm is not clean; non-cloning change
+rejected).
+
+---
+
+## ADR-021 — Prescription confidence is a BAND with a method, never a bare number
+**Context.** The prescription layer produces the number a CLIENT sees; the brief
+calls a bare "+8%" a credibility bomb. **Decision.** Every prescription carries a
+`ConfidenceAssessment` with per-fold estimates, the spread, seed sensitivity, a
+categorical level, and a plain-language rationale — the point estimate never
+travels alone. **Why.** A projected lift is only trustworthy if it is stable;
+stating it as a range with the evidence is honest, a lone percentage is not.
+**Status.** Locked. `prescription_types.py` / `classify_confidence`.
+
+## ADR-022 — Confidence via hold-out-and-replicate (+ seed sensitivity)
+**Context.** Need a real, non-theatrical confidence method. **Decision.** Split the
+population into k folds, measure the change independently on each, and require sign
+consistency to call it replicated; pair with re-running under different behavioral
+seeds. The fold spread is the band. **Why.** This empirically answers "if you'd had
+a fraction of the data, what range would you have gotten" — a genuine uncertainty.
+Verified: it caught a naturally-occurring ghost ("lead with balance" = +0.4pt on
+the full population but only 2/5 folds agree in sign) and refused it. We explicitly
+do NOT claim formal statistical-CI rigor — the band is an empirical hold-out
+spread, stated as such. **Status.** Locked.
+
+## ADR-023 — The layer refuses: not-clean and ghost are structural rejections
+**Context.** Honesty requires refusing bad recommendations, not just labeling them.
+**Decision.** `PrescriptionStatus` is structural: REJECTED_NOT_CLEAN (simulator
+verdict is false win / landmine / no improvement), REJECTED_GHOST (clean win that
+fails replication), or CANDIDATE. A rejected change can never be mistaken for a
+live one. A ghost is still RECORDED (not silently dropped) so the consultant knows
+it was checked and found unstable. **Why.** The most seductive bad change is one
+that looks like a win; structural refusal is stronger than a cautionary note.
+**Status.** Locked.
+
+## ADR-024 — Client-ready requires the Partner; the feedback loop records misses
+**Context.** Two final honesty gates. **Decision.** (1) `client_ready` is true only
+when a CANDIDATE also has validation=REAL and fairness=CLEAN from the Partner — the
+prescription layer does its own replication check but never self-certifies for a
+client. (2) `PrescriptionOutcome` records the projected band so a real post-
+implementation actual can be scored HIT / PARTIAL / MISS, openly. **Why.** Sentinel
+generates; the independent Partner signs off — two systems in tension. And the
+discipline must survive being wrong in front of a client: recording misses is how
+the tool earns trust and improves calibration across engagements. **Status.**
+Locked by tests (not-client-ready-without-partner; feedback HIT/PARTIAL/MISS).

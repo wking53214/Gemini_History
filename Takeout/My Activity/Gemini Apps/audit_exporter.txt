@@ -1,0 +1,113 @@
+"""
+Audit Exporter
+==============
+
+Export audit trails in various compliance-ready formats.
+HIPAA de-identification support.
+"""
+
+import json
+import csv
+from datetime import datetime
+from typing import List, Dict, Optional
+
+
+class ClinicalAuditExporter:
+    """Export clinical audit trails for compliance."""
+
+    @staticmethod
+    def export_json(
+        audit_entries: List[Dict],
+        filepath: str,
+        include_vitals: bool = False,
+    ) -> None:
+        """Export to JSON (for internal audit)."""
+        if include_vitals:
+            output = audit_entries
+        else:
+            # Remove PII/PHI
+            output = [
+                {
+                    "audit_id": e["audit_id"],
+                    "timestamp": e["timestamp"],
+                    "escalation_required": e["escalation_required"],
+                    "risk_score": e["fused_verdict"].get("risk_score"),
+                    "regime": e["fused_verdict"].get("regime"),
+                    "immutable_hash": e["immutable_hash"],
+                }
+                for e in audit_entries
+            ]
+
+        with open(filepath, "w") as f:
+            json.dump(output, f, indent=2, default=str)
+
+    @staticmethod
+    def export_hipaa_csv(
+        audit_entries: List[Dict],
+        filepath: str,
+    ) -> None:
+        """
+        Export to CSV with HIPAA de-identification.
+        Removes patient_id, replaces with hash.
+        """
+        with open(filepath, "w", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "assessment_date",
+                    "assessment_hour",
+                    "risk_score",
+                    "regime",
+                    "escalation",
+                    "audit_hash",
+                ],
+            )
+            writer.writeheader()
+
+            for entry in audit_entries:
+                ts = datetime.fromisoformat(entry["timestamp"])
+                writer.writerow({
+                    "assessment_date": ts.date().isoformat(),
+                    "assessment_hour": ts.hour,
+                    "risk_score": entry["fused_verdict"].get("risk_score", ""),
+                    "regime": entry["fused_verdict"].get("regime", ""),
+                    "escalation": entry["escalation_required"],
+                    "audit_hash": entry["immutable_hash"][:16],
+                })
+
+    @staticmethod
+    def export_fda_report(
+        audit_entries: List[Dict],
+        filepath: str,
+        system_version: str = "1.0",
+    ) -> None:
+        """
+        Export FDA-compliant report.
+        Includes system validation info.
+        """
+        report = {
+            "report_date": datetime.now().isoformat(),
+            "system_version": system_version,
+            "total_assessments": len(audit_entries),
+            "assessment_summary": {
+                "escalations": sum(
+                    1 for e in audit_entries if e["escalation_required"]
+                ),
+                "high_risk": sum(
+                    1 for e in audit_entries
+                    if e["fused_verdict"].get("risk_score", 0) > 0.75
+                ),
+                "regimes": {},
+            },
+            "audit_trail_hash": audit_entries[-1]["immutable_hash"] if audit_entries else "",
+        }
+
+        # Count regimes
+        for entry in audit_entries:
+            regime = entry["fused_verdict"].get("regime", "unknown")
+            report["assessment_summary"]["regimes"][regime] = (
+                report["assessment_summary"]["regimes"].get(regime, 0) + 1
+            )
+
+        with open(filepath, "w") as f:
+            json.dump(report, f, indent=2, default=str)

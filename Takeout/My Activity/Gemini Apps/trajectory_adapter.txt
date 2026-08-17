@@ -1,0 +1,140 @@
+"""
+Trajectory Adapter
+==================
+
+Analyzes vital sign momentum (first derivative) and acceleration (second derivative).
+Detects deteriorating trends that static rules miss.
+Selected when velocity/entropy high.
+"""
+
+from datetime import datetime, timezone
+from observe_engine import RiskOutput
+
+
+def trajectory_adapter(vitals) -> RiskOutput:
+    """
+    Analyze trajectories: momentum and acceleration of vital signs.
+
+    Args:
+        vitals: VitalsSnapshot (must have previous_ context for derivatives)
+
+    Returns:
+        RiskOutput based on trend analysis
+    """
+
+    # Extract history from context
+    previous_o2 = vitals.context.get("previous_o2")
+    previous_hr = vitals.context.get("previous_hr")
+    previous_rr = vitals.context.get("previous_rr")
+    previous_temp = vitals.context.get("previous_temp")
+
+    time_delta = vitals.context.get("time_delta_seconds", 60)  # Assume 60s if not provided
+
+    triggered_rules = []
+    risk_score = 0.0
+
+    if time_delta <= 0:
+        # Can't compute derivatives without time context
+        return RiskOutput(
+            engine_name="trajectory",
+            risk_score=0.0,
+            confidence=0.3,
+            regime_classification={"stable": 1.0},
+            triggered_rules=["Insufficient history for trajectory analysis"],
+            timestamp=datetime.now(timezone.utc),
+        )
+
+    # O2 saturation momentum (first derivative)
+    if previous_o2 is not None:
+        o2_momentum = (vitals.oxygen_saturation - previous_o2) / time_delta
+        if o2_momentum < -0.5:  # Dropping > 0.5%/second
+            triggered_rules.append(
+                f"O2_MOMENTUM: Dropping {abs(o2_momentum):.2f}%/sec "
+                f"({previous_o2:.1f} → {vitals.oxygen_saturation:.1f})"
+            )
+            risk_score += 0.4
+
+    # Heart rate momentum
+    if previous_hr is not None:
+        hr_momentum = (vitals.heart_rate - previous_hr) / time_delta
+        if hr_momentum > 2.0:  # Rising > 2 bpm/second
+            triggered_rules.append(
+                f"HR_MOMENTUM: Rising {hr_momentum:.2f} bpm/sec "
+                f"({previous_hr:.0f} → {vitals.heart_rate:.0f})"
+            )
+            risk_score += 0.3
+
+        if hr_momentum < -3.0:  # Dropping > 3 bpm/second
+            triggered_rules.append(
+                f"HR_DECELERATION: Dropping {abs(hr_momentum):.2f} bpm/sec "
+                f"({previous_hr:.0f} → {vitals.heart_rate:.0f})"
+            )
+            risk_score += 0.4
+
+    # Respiratory rate momentum
+    if previous_rr is not None:
+        rr_momentum = (vitals.respiratory_rate - previous_rr) / time_delta
+        if rr_momentum > 1.0:  # Rising > 1 breath/second
+            triggered_rules.append(
+                f"RR_MOMENTUM: Rising {rr_momentum:.2f} breaths/sec "
+                f"({previous_rr:.0f} → {vitals.respiratory_rate:.0f})"
+            )
+            risk_score += 0.25
+
+    # Temperature trajectory (hypothermia concern)
+    if previous_temp is not None:
+        temp_momentum = (vitals.temperature - previous_temp) / time_delta
+        if temp_momentum < -0.2:  # Dropping > 0.2°C/second (very fast)
+            triggered_rules.append(
+                f"TEMP_DROP: Rapidly falling {abs(temp_momentum):.3f}°C/sec "
+                f"({previous_temp:.1f} → {vitals.temperature:.1f})"
+            )
+            risk_score += 0.3
+
+    # Combined deterioration (multiple bad trends)
+    bad_trends = sum([
+        o2_momentum < -0.5 if previous_o2 is not None else False,
+        hr_momentum > 2.0 if previous_hr is not None else False,
+        rr_momentum > 1.0 if previous_rr is not None else False,
+    ])
+
+    if bad_trends >= 2:
+        triggered_rules.append(
+            f"MULTI_TREND_DETERIORATION: {bad_trends} vital signs trending badly simultaneously"
+        )
+        risk_score += 0.2
+
+    # Confidence based on history quality
+    history_quality = sum([
+        previous_o2 is not None,
+        previous_hr is not None,
+        previous_rr is not None,
+        previous_temp is not None,
+    ]) / 4.0
+
+    confidence = 0.5 + (0.4 * history_quality)  # 0.5-0.9 based on history quality
+
+    # Cap risk score
+    risk_score = min(risk_score, 1.0)
+
+    # Regime classification (momentum-based)
+    regime_probs = {
+        "stable": max(0, 1.0 - risk_score),
+        "caution": min(0.5, risk_score * 0.5),
+        "warning": min(0.3, risk_score * 0.3),
+        "critical": min(0.2, risk_score * 0.2),
+    }
+
+    # Normalize
+    total = sum(regime_probs.values())
+    if total > 0:
+        regime_probs = {k: v / total for k, v in regime_probs.items()}
+
+    return RiskOutput(
+        engine_name="trajectory",
+        risk_score=risk_score,
+        confidence=confidence,
+        regime_classification=regime_probs,
+        triggered_rules=triggered_rules,
+        timestamp=datetime.now(timezone.utc),
+    )

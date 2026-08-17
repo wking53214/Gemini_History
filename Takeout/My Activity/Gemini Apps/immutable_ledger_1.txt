@@ -1,0 +1,254 @@
+"""
+Immutable Governance Audit Ledger
+==================================
+
+Append-only audit trail for all policy decisions.
+SHA256 cryptographic chaining for tamper detection.
+Forensic replay support.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
+
+logger = logging.getLogger("PERCEIVE_AUDIT")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(
+        "[PERCEIVE_AUDIT] %(asctime)s %(levelname)s %(message)s"
+    ))
+    logger.addHandler(handler)
+
+
+# ============================================================
+# GOVERNANCE AUDIT ENTRY
+# ============================================================
+
+@dataclass
+class GovernanceAuditEntry:
+    """Single immutable policy decision entry."""
+    audit_id: str
+    timestamp: datetime
+    request_id: str
+    actor_id: str
+    request_type: str
+    evaluated_gates: List[str]
+    policy_outputs: List[Dict]
+    final_verdict: Dict
+    manifest_version: str
+    manifest_hash: str
+    previous_hash: str = ""
+    immutable_hash: str = ""
+
+
+# ============================================================
+# IMMUTABLE GOVERNANCE LEDGER
+# ============================================================
+
+class ImmutableGovernanceLedger:
+    """Append-only ledger for all governance decisions."""
+
+    def __init__(self):
+        self.entries: List[GovernanceAuditEntry] = []
+        self.chain_head = hashlib.sha256(b"PERCEIVE_GENESIS").hexdigest()
+        logger.info("ImmutableGovernanceLedger initialized")
+
+    def append_decision(
+        self,
+        request_id: str,
+        actor_id: str,
+        request_type: str,
+        evaluated_gates: List[str],
+        policy_outputs: List[Dict],
+        final_verdict: Dict,
+        manifest_version: str,
+        manifest_hash: str,
+    ) -> GovernanceAuditEntry:
+        """
+        Append policy decision to immutable ledger.
+        
+        Creates cryptographically chained entry that cannot be modified.
+        """
+
+        entry = GovernanceAuditEntry(
+            audit_id=hashlib.sha256(
+                f"{len(self.entries)}:{datetime.now(timezone.utc).isoformat()}:{request_id}".encode()
+            ).hexdigest()[:16],
+            timestamp=datetime.now(timezone.utc),
+            request_id=request_id,
+            actor_id=actor_id,
+            request_type=request_type,
+            evaluated_gates=evaluated_gates,
+            policy_outputs=policy_outputs,
+            final_verdict=final_verdict,
+            manifest_version=manifest_version,
+            manifest_hash=manifest_hash,
+            previous_hash=self.chain_head,
+        )
+
+        # Compute immutable hash
+        entry_dict = {
+            "audit_id": entry.audit_id,
+            "timestamp": entry.timestamp.isoformat(),
+            "request_id": entry.request_id,
+            "actor_id": entry.actor_id,
+            "request_type": entry.request_type,
+            "final_verdict": entry.final_verdict,
+        }
+
+        # Chain: hash(previous_hash + this_entry)
+        combined = entry.previous_hash + hashlib.sha256(
+            json.dumps(entry_dict, sort_keys=True, default=str).encode()
+        ).hexdigest()
+
+        entry.immutable_hash = hashlib.sha256(combined.encode()).hexdigest()
+        self.chain_head = entry.immutable_hash
+
+        self.entries.append(entry)
+        logger.info(
+            f"Policy decision logged: request={request_id}, "
+            f"actor={actor_id}, "
+            f"approved={entry.final_verdict.get('approved')}, "
+            f"hash={entry.immutable_hash[:16]}"
+        )
+
+        return entry
+
+    def verify_chain_integrity(self) -> bool:
+        """
+        Validate entire governance chain (detect tampering).
+        
+        Returns True if all hashes verify correctly.
+        """
+
+        expected_hash = hashlib.sha256(b"PERCEIVE_GENESIS").hexdigest()
+
+        for entry in self.entries:
+            entry_dict = {
+                "audit_id": entry.audit_id,
+                "timestamp": entry.timestamp.isoformat(),
+                "request_id": entry.request_id,
+                "actor_id": entry.actor_id,
+                "request_type": entry.request_type,
+                "final_verdict": entry.final_verdict,
+            }
+
+            combined = entry.previous_hash + hashlib.sha256(
+                json.dumps(entry_dict, sort_keys=True, default=str).encode()
+            ).hexdigest()
+
+            computed_hash = hashlib.sha256(combined.encode()).hexdigest()
+
+            if computed_hash != entry.immutable_hash:
+                logger.error(
+                    f"Chain integrity violation at {entry.audit_id}: "
+                    f"expected {expected_hash[:16]}, got {entry.immutable_hash[:16]}"
+                )
+                return False
+
+            expected_hash = entry.immutable_hash
+
+        logger.info(f"Governance chain integrity verified ({len(self.entries)} entries)")
+        return True
+
+    def export_audit_trail(self) -> List[Dict]:
+        """Export governance audit trail for compliance."""
+        return [
+            {
+                "audit_id": e.audit_id,
+                "timestamp": e.timestamp.isoformat(),
+                "request_id": e.request_id,
+                "actor_id": e.actor_id,
+                "request_type": e.request_type,
+                "approved": e.final_verdict.get("approved"),
+                "confidence": e.final_verdict.get("confidence"),
+                "evaluated_gates": e.evaluated_gates,
+                "manifest_version": e.manifest_version,
+                "immutable_hash": e.immutable_hash,
+            }
+            for e in self.entries
+        ]
+
+    def export_as_json(self, filepath: str) -> None:
+        """Export audit trail to JSON file."""
+        trail = self.export_audit_trail()
+        with open(filepath, "w") as f:
+            json.dump(trail, f, indent=2, default=str)
+        logger.info(f"Governance audit trail exported to {filepath}")
+
+    def export_as_csv(self, filepath: str) -> None:
+        """Export audit trail to CSV (SOX/HIPAA-compliant)."""
+        import csv
+
+        trail = self.export_audit_trail()
+
+        if not trail:
+            logger.warning("No entries to export")
+            return
+
+        with open(filepath, "w", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "audit_id",
+                    "timestamp",
+                    "request_id",
+                    "actor_id",
+                    "request_type",
+                    "approved",
+                    "confidence",
+                    "immutable_hash",
+                ],
+            )
+            writer.writeheader()
+
+            for entry in trail:
+                writer.writerow({
+                    "audit_id": entry["audit_id"],
+                    "timestamp": entry["timestamp"],
+                    "request_id": entry["request_id"],
+                    "actor_id": entry["actor_id"],
+                    "request_type": entry["request_type"],
+                    "approved": entry["approved"],
+                    "confidence": entry["confidence"],
+                    "immutable_hash": entry["immutable_hash"],
+                })
+
+        logger.info(f"Governance audit trail exported to CSV: {filepath}")
+
+    def query_actor(self, actor_id: str) -> List[GovernanceAuditEntry]:
+        """Retrieve all decisions made by actor."""
+        return [e for e in self.entries if e.actor_id == actor_id]
+
+    def query_request_type(self, request_type: str) -> List[GovernanceAuditEntry]:
+        """Retrieve all decisions for request type."""
+        return [e for e in self.entries if e.request_type == request_type]
+
+    def query_by_audit_id(self, audit_id: str) -> Optional[GovernanceAuditEntry]:
+        """Retrieve single governance decision by audit ID."""
+        for e in self.entries:
+            if e.audit_id == audit_id:
+                return e
+        return None
+
+    def get_chain_stats(self) -> Dict:
+        """Get statistics about governance chain."""
+        approved_count = sum(1 for e in self.entries if e.final_verdict.get("approved"))
+        rejected_count = len(self.entries) - approved_count
+
+        return {
+            "total_decisions": len(self.entries),
+            "approved": approved_count,
+            "rejected": rejected_count,
+            "approval_rate": approved_count / len(self.entries) if self.entries else 0,
+            "unique_actors": len(set(e.actor_id for e in self.entries)),
+            "request_types": list(set(e.request_type for e in self.entries)),
+            "chain_head_hash": self.chain_head[:16],
+            "chain_integrity_valid": self.verify_chain_integrity(),
+        }

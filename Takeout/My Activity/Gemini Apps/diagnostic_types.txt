@@ -1,0 +1,173 @@
+"""
+diagnostic_types.py — The result vocabulary of the diagnostic engine.
+
+The central design choice here is that TRUST LEVEL IS STRUCTURAL. A `Finding`
+(from the transparent scan) and a `Candidate` (from the deeper tree discovery) are
+DIFFERENT TYPES, not the same object with a flag. This is deliberate: the whole
+honesty discipline rests on never letting a speculative pattern masquerade as a
+solid one, and the cleanest way to enforce that is to make them un-confusable in
+the type system. You cannot accidentally hand a client a Candidate thinking it is
+a Finding, because they do not share a class.
+
+  Finding   = a leak the transparent single/pairwise scan found. Human-legible,
+              directly checkable, shippable as something you can stand behind today.
+  Candidate = a deeper interaction the tree discovery found. A LEAD, not a finding.
+              Explicitly unvalidated. Carries everything the future Partner
+              (validation + fairness) engine needs to interrogate it.
+
+THE PARTNER SEAM
+----------------
+Every Candidate (and every Finding, for symmetry) carries two verdict slots that
+are EMPTY by default:
+  validation_verdict : filled later by the Partner's validation engine
+                       (real / ghost / inconclusive, with replication evidence).
+  fairness_verdict   : filled later by the Partner's disparate-impact auditor.
+Until both are filled, a Candidate must NOT be surfaced to a client as a
+recommendation. The default `UNASSESSED` verdict encodes exactly that.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, List, Optional, Tuple
+
+
+class Verdict(str, Enum):
+    """A verdict slot the Partner system fills. UNASSESSED is the honest default:
+    until something is assessed, it is not safe to act on."""
+    UNASSESSED = "UNASSESSED"      # default — Partner has not looked yet
+    REAL = "REAL"                  # validation: replicates / survives scrutiny
+    GHOST = "GHOST"                # validation: does not replicate; an artifact
+    INCONCLUSIVE = "INCONCLUSIVE"  # validation: not enough support to say
+    CLEAN = "CLEAN"                # fairness: no disparate impact
+    FLAGGED = "FLAGGED"            # fairness: tracks a protected attribute / disparate impact
+
+
+@dataclass
+class SegmentSpec:
+    """A definition of a caller segment as a set of observed-attribute constraints.
+    e.g. {"reason": "fraud", "channel": "phone"}. Deliberately a plain dict of
+    observed attributes — never includes the hidden disposition, and the engine
+    flags (does not silently use) any constraint on a protected attribute."""
+    constraints: Dict[str, object] = field(default_factory=dict)
+
+    def describe(self) -> str:
+        if not self.constraints:
+            return "ALL callers"
+        return " & ".join(f"{k}={v}" for k, v in sorted(self.constraints.items()))
+
+    def matches(self, observed: Dict[str, object]) -> bool:
+        return all(observed.get(k) == v for k, v in self.constraints.items())
+
+
+@dataclass
+class ContainmentStats:
+    """The containment picture for a segment — including the honesty decomposition
+    that separates REAL containment from FAKE (contained-but-unresolved)."""
+    n: int
+    contained: int                 # left without an agent (real + fake)
+    resolved: int                  # actually resolved (true containment)
+    fake_contained: int            # left "handled" but unresolved (will call back)
+    reached_agent: int
+    poundout: int
+    hangup: int
+
+    @property
+    def containment_rate(self) -> float:
+        return self.contained / self.n if self.n else 0.0
+
+    @property
+    def true_resolution_rate(self) -> float:
+        return self.resolved / self.n if self.n else 0.0
+
+    @property
+    def fake_containment_rate(self) -> float:
+        return self.fake_contained / self.n if self.n else 0.0
+
+    @property
+    def fake_share_of_contained(self) -> float:
+        """Of the calls that LOOK contained, what fraction are actually fake.
+        This is the number a dashboard hides — it counts fake and real alike."""
+        return self.fake_contained / self.contained if self.contained else 0.0
+
+
+@dataclass
+class Finding:
+    """A leak the TRANSPARENT scan found. Shippable; you can stand behind it.
+    Still carries Partner verdict slots for symmetry and for the fairness check."""
+    segment: SegmentSpec
+    stats: ContainmentStats
+    # how this leak compares to the overall population (the size of the problem)
+    containment_gap_vs_overall: float      # negative = worse than overall
+    fake_gap_vs_overall: float             # positive = more fake containment than overall
+    method: str = "scan"                   # "scan:single" or "scan:pairwise"
+    rationale: str = ""
+    # Partner seam (empty until assessed)
+    validation_verdict: Verdict = Verdict.UNASSESSED
+    fairness_verdict: Verdict = Verdict.UNASSESSED
+    notes: List[str] = field(default_factory=list)
+
+    @property
+    def safe_to_surface(self) -> bool:
+        """A finding is safe to put in front of a client only once fairness is
+        assessed clean. Validation is advisory for scan findings (they are
+        transparent), but fairness is a hard gate."""
+        return self.fairness_verdict in (Verdict.CLEAN,) or (
+            self.fairness_verdict == Verdict.UNASSESSED and not self._touches_protected())
+
+    def _touches_protected(self, protected_keys=("protected_group", "age_band")) -> bool:
+        return any(k in self.segment.constraints for k in protected_keys)
+
+
+@dataclass
+class Candidate:
+    """A deeper interaction the TREE discovery found. A LEAD, not a finding.
+    UNVALIDATED by construction. Must not reach a client until the Partner fills
+    both verdict slots. This is the primary object the Partner system consumes."""
+    segment: SegmentSpec
+    stats: ContainmentStats
+    containment_gap_vs_overall: float
+    fake_gap_vs_overall: float
+    depth: int                             # how many attributes deep the split is
+    support: int                           # n in the segment (small support = ghost risk)
+    method: str = "tree"
+    rationale: str = ""
+    # cross-check against the transparent scan (cheap first plausibility filter)
+    corroborated_by_scan: Optional[bool] = None
+    # Partner seam (empty until assessed) — a Candidate is NEVER client-ready until filled
+    validation_verdict: Verdict = Verdict.UNASSESSED
+    fairness_verdict: Verdict = Verdict.UNASSESSED
+    notes: List[str] = field(default_factory=list)
+
+    @property
+    def client_ready(self) -> bool:
+        """A candidate is client-ready ONLY when validation says REAL and fairness
+        says CLEAN. The honest default (UNASSESSED) is never client-ready."""
+        return (self.validation_verdict == Verdict.REAL
+                and self.fairness_verdict == Verdict.CLEAN)
+
+
+@dataclass
+class DiagnosticReport:
+    """The full output of one diagnostic run. Two tiers, kept separate by type, plus
+    the overall picture and any fairness flags raised during discovery."""
+    overall: ContainmentStats
+    findings: List[Finding] = field(default_factory=list)        # Tier 1: trusted
+    candidates: List[Candidate] = field(default_factory=list)    # Tier 2: leads
+    fairness_flags: List[str] = field(default_factory=list)      # raised during discovery
+    assumptions: List[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        o = self.overall
+        lines = [
+            "DIAGNOSTIC REPORT",
+            f"  Overall: {o.n} calls, containment {o.containment_rate:.1%} "
+            f"(true resolution {o.true_resolution_rate:.1%}, "
+            f"fake {o.fake_containment_rate:.1%} = {o.fake_share_of_contained:.0%} of contained)",
+            f"  Tier 1 FINDINGS (transparent scan, shippable): {len(self.findings)}",
+            f"  Tier 2 CANDIDATES (tree leads, UNVALIDATED): {len(self.candidates)}",
+        ]
+        if self.fairness_flags:
+            lines.append(f"  FAIRNESS FLAGS: {len(self.fairness_flags)}")
+        return "\n".join(lines)

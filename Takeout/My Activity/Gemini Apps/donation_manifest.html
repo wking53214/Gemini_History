@@ -1,0 +1,354 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+    @page {
+        size: A4;
+        margin: 20mm 15mm;
+        background-color: #ffffff;
+        @bottom-right {
+            content: "Page " counter(page) " of " counter(pages);
+            font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+            font-size: 8pt;
+            color: #718096;
+        }
+    }
+    
+    *, *::before, *::after {
+        box-sizing: border-box;
+    }
+    
+    body {
+        margin: 0;
+        padding: 0;
+        font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+        color: #2d3748;
+        line-height: 1.5;
+        font-size: 10pt;
+    }
+    
+    .header-container {
+        border-bottom: 3px solid #2b6cb0;
+        padding-bottom: 20px;
+        margin-bottom: 25px;
+    }
+    
+    .company-title {
+        font-size: 24pt;
+        font-weight: bold;
+        color: #1a365d;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        margin: 0 0 5px 0;
+    }
+    
+    .document-type {
+        font-size: 14pt;
+        color: #4a5568;
+        font-weight: 500;
+        margin: 0;
+    }
+    
+    .meta-table {
+        width: 100%;
+        margin-bottom: 30px;
+        border-collapse: collapse;
+    }
+    
+    .meta-cell {
+        width: 50%;
+        vertical-align: top;
+    }
+    
+    .meta-label {
+        font-size: 9pt;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        color: #718096;
+        font-weight: bold;
+        margin-bottom: 5px;
+    }
+    
+    .meta-value {
+        font-size: 11pt;
+        color: #2d3748;
+    }
+    
+    .summary-card {
+        background-color: #f7fafc;
+        border: 1px solid #e2e8f0;
+        border-radius: 4px;
+        padding: 15px 20px;
+        margin-bottom: 30px;
+    }
+    
+    .summary-title {
+        font-size: 11pt;
+        font-weight: bold;
+        color: #2b6cb0;
+        margin-top: 0;
+        margin-bottom: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+    
+    .summary-grid {
+        display: table;
+        width: 100%;
+    }
+    
+    .summary-col {
+        display: table-cell;
+        width: 33.33%;
+    }
+    
+    .item-table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-bottom: 30px;
+    }
+    
+    .item-table th {
+        background-color: #2b6cb0;
+        color: #ffffff;
+        font-weight: bold;
+        text-transform: uppercase;
+        font-size: 9pt;
+        letter-spacing: 0.5px;
+        padding: 8px 12px;
+        text-align: left;
+    }
+    
+    .item-table th.num-col, .item-table td.num-col {
+        text-align: right;
+    }
+    
+    .item-table td {
+        padding: 8px 12px;
+        border-bottom: 1px solid #e2e8f0;
+        font-size: 9.5pt;
+    }
+    
+    .item-table tr:nth-child(even) td {
+        background-color: #f7fafc;
+    }
+    
+    .totals-table {
+        width: 40%;
+        margin-left: auto;
+        border-collapse: collapse;
+        margin-bottom: 40px;
+    }
+    
+    .totals-table td {
+        padding: 6px 12px;
+        font-size: 10pt;
+    }
+    
+    .totals-label {
+        text-align: right;
+        color: #4a5568;
+        font-weight: 500;
+    }
+    
+    .totals-value {
+        text-align: right;
+        font-weight: bold;
+        color: #2d3748;
+    }
+    
+    .grand-total-row td {
+        border-top: 2px solid #2b6cb0;
+        border-bottom: 2px solid #2b6cb0;
+        font-size: 12pt !important;
+        font-weight: bold;
+        color: #1a365d !important;
+        padding: 10px 12px;
+    }
+    
+    .footer-note {
+        border-top: 1px solid #e2e8f0;
+        padding-top: 15px;
+        font-size: 8.5pt;
+        color: #718096;
+        text-align: center;
+        line-height: 1.4;
+    }
+    
+    .page-break-avoid {
+        page-break-inside: avoid;
+    }
+</style>
+</head>
+<body>
+
+    <div class="header-container">
+        <h1 class="company-title">Asset Tracking & Inventory System</h1>
+        <p class="document-type">Non-Profit Valuation Manifest & Tax Receipt Summary</p>
+    </div>
+
+    <table class="meta-table">
+        <tr>
+            <td class="meta-cell">
+                <div class="meta-label">Prepared For</div>
+                <div class="meta-value">
+                    <strong>[REDACTED_NAME] Nathaniel King</strong><br>
+                    Columbus/New Albany Area, OH
+                </div>
+            </td>
+            <td class="meta-cell" style="text-align: right;">
+                <div class="meta-label">Manifest Date</div>
+                <div class="meta-value" style="margin-bottom: 10px;">June 16, 2026</div>
+                <div class="meta-label">Status</div>
+                <div class="meta-value"><strong>Balanced & Audit-Ready</strong></div>
+            </td>
+        </tr>
+    </table>
+
+    <div class="summary-card">
+        <h3 class="summary-title">Portfolio Execution Metrics</h3>
+        <div class="summary-grid">
+            <div class="summary-col">
+                <div class="meta-label">Donation Inventory Volume</div>
+                <div class="meta-value" style="font-size: 14pt; font-weight: bold; color: #2b6cb0;">188 Items</div>
+            </div>
+            <div class="summary-col">
+                <div class="meta-label">Cumulative Donation FMV</div>
+                <div class="meta-value" style="font-size: 14pt; font-weight: bold; color: #2b6cb0;">$1,661.00</div>
+            </div>
+            <div class="summary-col">
+                <div class="meta-label">Consignment Pool Extraction</div>
+                <div class="meta-value" style="font-size: 14pt; font-weight: bold; color: #2c5282;">18 Items ($278.00 – $386.00)</div>
+            </div>
+        </div>
+    </div>
+
+    <h3 style="font-size: 12pt; text-transform: uppercase; letter-spacing: 0.5px; color: #1a365d; margin-bottom: 12px;">Recent Processing Activity (Batches 22–36 Manifest)</h3>
+    <table class="item-table">
+        <thead>
+            <tr>
+                <th style="width: 12%;">Item Range</th>
+                <th style="width: 58%;">Batch Classification & Parameter Specs</th>
+                <th style="width: 15%;">Condition Profile</th>
+                <th class="num-col" style="width: 15%;">Assessed FMV</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>126–131</td>
+                <td>Batch 22: Casual Fashion Accessories / Belts (Size 4', Length ~48") - 6 Units [Item 127 NWT]</td>
+                <td>Very Good / NWT</td>
+                <td class="num-col">$33.00</td>
+            </tr>
+            <tr>
+                <td>132–134</td>
+                <td>Batch 23: Heavy-Duty Genuine Leather Utility Belts (Sizes 2x 46", 1x 44") - 3 Units</td>
+                <td>Very Good</td>
+                <td class="num-col">$18.00</td>
+            </tr>
+            <tr>
+                <td>135–138</td>
+                <td>Batch 24: Footwear & Small Pouch (Cobb Hill 10M, Umberto Raffini EU 41, Crossbody) - 4 Units</td>
+                <td>Good / Very Good</td>
+                <td class="num-col">$31.00</td>
+            </tr>
+            <tr>
+                <td>139–140</td>
+                <td>Batch 25: Weatherproof Insulated Men's Winter Elements Boots (Size 11) - 2 Units</td>
+                <td>Very Good</td>
+                <td class="num-col">$33.00</td>
+            </tr>
+            <tr>
+                <td>141</td>
+                <td>Batch 26: Lack of Color Camel 100% Australian Wool Fedora (Size M / 57cm) - *Consignment Channel*</td>
+                <td>Pristine</td>
+                <td class="num-col">[Consigned]</td>
+            </tr>
+            <tr>
+                <td>142–148</td>
+                <td>Batch 27: Casual Everyday Apparel & Boutique Loungewear Stack (Size M / Youth 12) - 7 Units</td>
+                <td>Good / Very Good</td>
+                <td class="num-col">$42.00</td>
+            </tr>
+            <tr>
+                <td>149–152</td>
+                <td>Batch 28: Performance/Theatrical White Fabric Stretch Dance Gloves - 4 Pairs</td>
+                <td>Very Good</td>
+                <td class="num-col">$8.00</td>
+            </tr>
+            <tr>
+                <td>153–161</td>
+                <td>Batch 29: Athleisure Basics, Fandom Graphic Tees, Concert Merchandise (Size M) - 9 Units</td>
+                <td>Good / Very Good</td>
+                <td class="num-col">$54.00</td>
+            </tr>
+            <tr>
+                <td>162–165</td>
+                <td>Batch 30: Regional High-Waisted Bike Shorts & Local Spirit Wear Hoodies (Size M) - 4 Units</td>
+                <td>Very Good</td>
+                <td class="num-col">$37.00</td>
+            </tr>
+            <tr>
+                <td>166–174</td>
+                <td>Batch 31: Character Graphic Tops, Regional Souvenir Tees, Performance Leotard (Size M) - 9 Units</td>
+                <td>Good / Very Good</td>
+                <td class="num-col">$50.00</td>
+            </tr>
+            <tr>
+                <td>175–177</td>
+                <td>Batch 32: Licensed Band Merchandise & Typographic Casual Apparel (Size M) - 2 Units</td>
+                <td>Very Good</td>
+                <td class="num-col">$15.00</td>
+            </tr>
+            <tr>
+                <td>178–186</td>
+                <td>Batch 33: Student Organizations, Conference Promo Shirts, Spandex coordinates (Size M) - 9 Units</td>
+                <td>Very Good</td>
+                <td class="num-col">$44.00</td>
+            </tr>
+            <tr>
+                <td>187</td>
+                <td>Batch 34: Soucrat Two-Piece Flutter-Sleeve Floral Swimwear Set (Size M) - 1 Unit</td>
+                <td>Very Good</td>
+                <td class="num-col">$8.00</td>
+            </tr>
+            <tr>
+                <td>188</td>
+                <td>Batch 35: Kona Sol Two-Piece Tropical Palm Print Swimwear Set (Size M) - 1 Unit</td>
+                <td>Very Good</td>
+                <td class="num-col">$8.00</td>
+            </tr>
+            <tr>
+                <td>189–190</td>
+                <td>Batch 36: Official Licensed Exhibition Merchandise & Novelty Crew Apparel (Size M/L) - 2 Units</td>
+                <td>Very Good</td>
+                <td class="num-col">$10.00</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="page-break-avoid">
+        <table class="totals-table">
+            <tr>
+                <td class="totals-label">Donation Subtotal (Batches 22-36):</td>
+                <td class="totals-value">$391.00</td>
+            </tr>
+            <tr>
+                <td class="totals-label">Prior Batches Retained Value:</td>
+                <td class="totals-value">$1,270.00</td>
+            </tr>
+            <tr class="grand-total-row">
+                <td class="totals-label">Total Cumulative FMV:</td>
+                <td class="totals-value">$1,661.00</td>
+            </tr>
+        </table>
+
+        <div class="footer-note">
+            This valuation manifest has been prepared utilizing objective, standardized IRS-compliant fair market value criteria modeled alongside established national charitable valuation baselines. All entries have been structurally cataloged, cross-referenced, and audited for data integrity to preserve a reliable audit trail for tax deduction reporting.
+        </div>
+    </div>
+
+</body>
+</html>

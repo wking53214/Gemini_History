@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GALLM v4 - Governance Kernel Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #f5f5f5;
+    padding: 20px;
+  }
+  .container { max-width: 1200px; margin: 0 auto; }
+  h1 {
+    font-size: 28px;
+    font-weight: 500;
+    margin-bottom: 8px;
+    color: #1a1a1a;
+  }
+  .subtitle {
+    font-size: 14px;
+    color: #666;
+    margin-bottom: 24px;
+  }
+  .metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+  .metric-card {
+    background: white;
+    border: 0.5px solid #e0e0e0;
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .metric-label {
+    font-size: 12px;
+    color: #999;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 8px;
+  }
+  .metric-value {
+    font-size: 28px;
+    font-weight: 500;
+    color: #1a1a1a;
+  }
+  .metric-subtext {
+    font-size: 12px;
+    color: #666;
+    margin-top: 8px;
+  }
+  .chart-section {
+    background: white;
+    border: 0.5px solid #e0e0e0;
+    border-radius: 8px;
+    padding: 20px;
+    margin-bottom: 24px;
+  }
+  .chart-title {
+    font-size: 16px;
+    font-weight: 500;
+    margin-bottom: 16px;
+    color: #1a1a1a;
+  }
+  .chart-wrapper {
+    position: relative;
+    height: 300px;
+    width: 100%;
+  }
+  .two-column {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 24px;
+    margin-bottom: 24px;
+  }
+  .gate-list, .invariant-list {
+    background: white;
+    border: 0.5px solid #e0e0e0;
+    border-radius: 8px;
+    padding: 20px;
+  }
+  .list-title {
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 12px;
+    color: #1a1a1a;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .list-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 0;
+    border-bottom: 0.5px solid #f0f0f0;
+    font-size: 13px;
+  }
+  .list-item:last-child {
+    border-bottom: none;
+  }
+  .list-item-name {
+    color: #1a1a1a;
+    font-weight: 500;
+  }
+  .list-item-rate {
+    color: #666;
+    font-variant-numeric: tabular-nums;
+  }
+  .status-bar {
+    height: 4px;
+    background: #f0f0f0;
+    border-radius: 2px;
+    margin-top: 8px;
+    overflow: hidden;
+  }
+  .status-fill {
+    height: 100%;
+    background: #4CAF50;
+  }
+  .status-fill.warning {
+    background: #FFC107;
+  }
+  .status-fill.error {
+    background: #f44336;
+  }
+  .audit-section {
+    background: white;
+    border: 0.5px solid #e0e0e0;
+    border-radius: 8px;
+    padding: 20px;
+    margin-bottom: 24px;
+  }
+  .audit-entry {
+    padding: 12px 0;
+    border-bottom: 0.5px solid #f0f0f0;
+    font-size: 13px;
+  }
+  .audit-entry:last-child {
+    border-bottom: none;
+  }
+  .audit-header {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 8px;
+  }
+  .audit-seq {
+    color: #999;
+    font-size: 12px;
+  }
+  .audit-decision {
+    font-weight: 500;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    text-transform: uppercase;
+  }
+  .audit-decision.accepted {
+    background: #e8f5e9;
+    color: #2e7d32;
+  }
+  .audit-decision.rejected {
+    background: #ffebee;
+    color: #c62828;
+  }
+  .audit-decision.violation {
+    background: #fff3e0;
+    color: #e65100;
+  }
+  .audit-event {
+    color: #666;
+    margin-bottom: 4px;
+  }
+  .audit-gates {
+    color: #999;
+    font-size: 11px;
+    margin-top: 4px;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>GALLM v4 — Governance Kernel</h1>
+  <p class="subtitle">Synthetic clinical dataset execution (290 patients, 580 events)</p>
+
+  <div class="metrics-grid">
+    <div class="metric-card">
+      <div class="metric-label">Total Events</div>
+      <div class="metric-value" id="total-events">—</div>
+      <div class="metric-subtext">Admission + Observation</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">Acceptance Rate</div>
+      <div class="metric-value" id="acceptance-rate">—</div>
+      <div class="metric-subtext">Passed all gates + invariants</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">Gate Rejections</div>
+      <div class="metric-value" id="gate-rejections">—</div>
+      <div class="metric-subtext">Decision-point blocks</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">Invariant Violations</div>
+      <div class="metric-value" id="invariant-violations">—</div>
+      <div class="metric-subtext">State constraint failures</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">Fault Detections</div>
+      <div class="metric-value" id="fault-detections">—</div>
+      <div class="metric-subtext">Exception or type errors</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">State Hashes</div>
+      <div class="metric-value" id="state-hashes">—</div>
+      <div class="metric-subtext">Valid states persisted</div>
+    </div>
+  </div>
+
+  <div class="chart-section">
+    <div class="chart-title">Decision Distribution</div>
+    <div class="chart-wrapper">
+      <canvas id="decisionChart" role="img" aria-label="Distribution of event decisions"></canvas>
+    </div>
+  </div>
+
+  <div class="two-column">
+    <div class="chart-section">
+      <div class="chart-title">Cumulative Decisions Over Time</div>
+      <div class="chart-wrapper" style="height: 250px;">
+        <canvas id="timelineChart" role="img" aria-label="Decision timeline"></canvas>
+      </div>
+    </div>
+    <div>
+      <div class="gate-list">
+        <div class="list-title">Gate Fault Rates</div>
+        <div id="gate-list"></div>
+      </div>
+      <div class="invariant-list" style="margin-top: 24px;">
+        <div class="list-title">Invariant Fault Rates</div>
+        <div id="invariant-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="audit-section">
+    <div class="list-title">Recent Audit Entries (Sample)</div>
+    <div id="audit-log"></div>
+  </div>
+</div>
+
+<script>
+async function loadData() {
+  try {
+    const response = await fetch('data.json');
+    const data = await response.json();
+    return data;
+  } catch (e) {
+    console.error('Failed to load data:', e);
+    return null;
+  }
+}
+
+async function init() {
+  const data = await loadData();
+  if (!data) {
+    document.body.innerHTML = '<p style="padding: 40px; color: #999;">Data not available. Run: python -c "import json; from gallm_reference_impl import *; ..." > data.json</p>';
+    return;
+  }
+
+  // Populate metrics
+  document.getElementById('total-events').textContent = data.report.total_events;
+  document.getElementById('acceptance-rate').textContent = data.report.acceptance_rate.toFixed(1) + '%';
+  document.getElementById('gate-rejections').textContent = data.report.gate_rejections;
+  document.getElementById('invariant-violations').textContent = data.report.invariant_violations;
+  document.getElementById('fault-detections').textContent = data.report.fault_detections;
+  document.getElementById('state-hashes').textContent = data.report.state_store_size;
+
+  // Decision pie chart
+  new Chart(document.getElementById('decisionChart'), {
+    type: 'doughnut',
+    data: {
+      labels: ['Accepted', 'Gate Rejected', 'Invariant Violated', 'Fault Detected'],
+      datasets: [{
+        data: [
+          data.report.accepted,
+          data.report.gate_rejections,
+          data.report.invariant_violations,
+          data.report.fault_detections
+        ],
+        backgroundColor: ['#4CAF50', '#FF9800', '#FFC107', '#f44336']
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { position: 'bottom' }
+      }
+    }
+  });
+
+  // Timeline chart
+  const timeline = {
+    accepted: 0,
+    rejected: 0,
+    violated: 0,
+    faulted: 0,
+    points: []
+  };
+
+  data.audit_log.forEach((entry, idx) => {
+    if (entry.decision === 'ACCEPTED') timeline.accepted++;
+    else if (entry.decision === 'GATE_REJECTED') timeline.rejected++;
+    else if (entry.decision === 'INVARIANT_VIOLATED') timeline.violated++;
+    else timeline.faulted++;
+
+    if (idx % 50 === 0 || idx === data.audit_log.length - 1) {
+      timeline.points.push({
+        seq: entry.sequence_number,
+        accepted: timeline.accepted,
+        rejected: timeline.rejected,
+        violated: timeline.violated,
+        faulted: timeline.faulted
+      });
+    }
+  });
+
+  new Chart(document.getElementById('timelineChart'), {
+    type: 'line',
+    data: {
+      labels: timeline.points.map(p => `#${p.seq}`),
+      datasets: [
+        {
+          label: 'Accepted',
+          data: timeline.points.map(p => p.accepted),
+          borderColor: '#4CAF50',
+          backgroundColor: 'rgba(76, 175, 80, 0.1)',
+          tension: 0.3
+        },
+        {
+          label: 'Rejected',
+          data: timeline.points.map(p => p.rejected),
+          borderColor: '#FF9800',
+          backgroundColor: 'rgba(255, 152, 0, 0.1)',
+          tension: 0.3
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        y: { beginAtZero: true }
+      },
+      plugins: {
+        legend: { display: true }
+      }
+    }
+  });
+
+  // Gate fault rates
+  const gateList = document.getElementById('gate-list');
+  Object.entries(data.report.gate_fault_rates).forEach(([name, rate]) => {
+    const div = document.createElement('div');
+    div.className = 'list-item';
+    div.innerHTML = `
+      <span class="list-item-name">${name}</span>
+      <span class="list-item-rate">${rate.toFixed(1)}% fault</span>
+    `;
+    const bar = document.createElement('div');
+    bar.className = 'status-bar';
+    const fill = document.createElement('div');
+    fill.className = 'status-fill' + (rate > 10 ? ' warning' : '') + (rate > 20 ? ' error' : '');
+    fill.style.width = Math.min(rate, 100) + '%';
+    bar.appendChild(fill);
+    div.appendChild(bar);
+    gateList.appendChild(div);
+  });
+
+  // Invariant fault rates
+  const invList = document.getElementById('invariant-list');
+  Object.entries(data.report.invariant_fault_rates).forEach(([name, rate]) => {
+    const div = document.createElement('div');
+    div.className = 'list-item';
+    div.innerHTML = `
+      <span class="list-item-name">${name}</span>
+      <span class="list-item-rate">${rate.toFixed(1)}% fault</span>
+    `;
+    const bar = document.createElement('div');
+    bar.className = 'status-bar';
+    const fill = document.createElement('div');
+    fill.className = 'status-fill' + (rate > 10 ? ' warning' : '') + (rate > 20 ? ' error' : '');
+    fill.style.width = Math.min(rate, 100) + '%';
+    bar.appendChild(fill);
+    div.appendChild(bar);
+    invList.appendChild(div);
+  });
+
+  // Audit log (sample first 15 entries)
+  const auditLog = document.getElementById('audit-log');
+  data.audit_log.slice(0, 15).forEach(entry => {
+    const div = document.createElement('div');
+    div.className = 'audit-entry';
+    const statusClass = entry.decision === 'ACCEPTED' ? 'accepted' : 
+                       entry.decision === 'GATE_REJECTED' ? 'rejected' : 'violation';
+    const eventStr = entry.event ? `${entry.event.event_type} (${entry.event.context_id})` : 'N/A';
+    const gateStr = Object.entries(entry.gate_results)
+      .map(([k, [r]]) => `${k}: ${r ? '✓' : '✗'}`)
+      .join(' | ') || '—';
+
+    div.innerHTML = `
+      <div class="audit-header">
+        <span class="audit-seq">Seq #${entry.sequence_number}</span>
+        <span class="audit-decision ${statusClass}">${entry.decision}</span>
+      </div>
+      <div class="audit-event">${eventStr}</div>
+      <div class="audit-gates">${gateStr}</div>
+    `;
+    auditLog.appendChild(div);
+  });
+}
+
+init();
+</script>
+</body>
+</html>

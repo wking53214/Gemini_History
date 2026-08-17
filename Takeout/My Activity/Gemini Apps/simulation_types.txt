@@ -1,0 +1,151 @@
+"""
+simulation_types.py — The result vocabulary of the honest-measurement simulator.
+
+The central design choice: the DISTRIBUTION of a change's effect is first-class,
+not a footnote. A change is never summarized by its net number alone, because the
+whole danger is that a great average can hide a brutal minority hit ("+10% on 25%,
+but 5% now agent-only"). So the primary object carries:
+
+  - the NET effect (the headline, but never the whole story)
+  - the PER-SEGMENT effect (who was helped, who was hurt, by how much)
+  - an explicit HARM flag and the worst-hurt segment, surfaced at the top level
+
+If a result is printed and someone reads only the net number, the harm must still
+be impossible to miss — so `harmful_segments` and `worst_harm` sit right next to
+`net_containment_delta`, not three layers down.
+
+HONESTY DECOMPOSITION CARRIES THROUGH
+------------------------------------
+Every effect is measured on BOTH containment (real + fake) AND true resolution,
+because a change can raise containment while raising FAKE containment — i.e. trap
+more callers in unresolved self-service. A simulator that only watched the top-line
+containment number would call that an improvement. We watch both.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+
+@dataclass
+class OutcomeMix:
+    """The outcome distribution for a set of callers — the full picture a single
+    rate would hide."""
+    n: int
+    contained: int            # real + fake
+    resolved: int             # true containment
+    fake_contained: int       # contained but unresolved (will call back)
+    reached_agent: int
+    poundout: int
+    hangup: int
+
+    @property
+    def containment_rate(self) -> float:
+        return self.contained / self.n if self.n else 0.0
+
+    @property
+    def true_resolution_rate(self) -> float:
+        return self.resolved / self.n if self.n else 0.0
+
+    @property
+    def fake_containment_rate(self) -> float:
+        return self.fake_contained / self.n if self.n else 0.0
+
+    @property
+    def agent_rate(self) -> float:
+        return self.reached_agent / self.n if self.n else 0.0
+
+
+@dataclass
+class SegmentEffect:
+    """How a change affected one segment. Deltas are (variant - baseline); positive
+    containment delta = improvement, positive agent delta = more callers forced to
+    an agent (usually bad)."""
+    label: str
+    n: int
+    containment_delta: float
+    true_resolution_delta: float
+    fake_containment_delta: float
+    agent_delta: float
+    baseline: OutcomeMix
+    variant: OutcomeMix
+
+    @property
+    def is_harmed(self) -> bool:
+        """A segment is HARMED if the change materially lowers its containment,
+        materially raises the share forced to an agent, OR materially raises its
+        FAKE containment (trapping more callers unresolved). Any of these is a real
+        harm even if the net across the population looks good."""
+        return (self.containment_delta <= -SEGMENT_HARM_THRESHOLD
+                or self.agent_delta >= SEGMENT_HARM_THRESHOLD
+                or self.fake_containment_delta >= SEGMENT_HARM_THRESHOLD)
+
+    @property
+    def is_helped(self) -> bool:
+        return self.containment_delta >= SEGMENT_HARM_THRESHOLD and not self.is_harmed
+
+
+# A per-segment change at least this large (in rate points) counts as material.
+# ILLUSTRATIVE — not calibrated against a real contact center.
+SEGMENT_HARM_THRESHOLD = 0.03
+
+
+@dataclass
+class SimulationResult:
+    """The full distributional effect of ONE proposed change. The net number is the
+    headline; the harm sits right next to it so it cannot be missed."""
+    change_description: str
+    population_n: int
+
+    # headline (never the whole story)
+    net_containment_delta: float
+    net_true_resolution_delta: float
+    net_fake_containment_delta: float
+    net_agent_delta: float
+
+    overall_baseline: OutcomeMix
+    overall_variant: OutcomeMix
+
+    # the distribution — first-class, sits beside the headline
+    segment_effects: List[SegmentEffect] = field(default_factory=list)
+    harmful_segments: List[SegmentEffect] = field(default_factory=list)
+    helped_segments: List[SegmentEffect] = field(default_factory=list)
+    worst_harm: Optional[SegmentEffect] = None
+
+    # honest verdict on whether this is a clean win or a landmine
+    verdict: str = ""
+    notes: List[str] = field(default_factory=list)
+    assumptions: List[str] = field(default_factory=list)
+
+    @property
+    def is_clean_win(self) -> bool:
+        """A clean win raises net containment AND net true resolution, raises net
+        fake containment by no more than noise, AND harms no segment. The
+        conjunction is the point: a net gain with a harmed segment is NOT clean."""
+        return (self.net_containment_delta > 0
+                and self.net_true_resolution_delta > 0
+                and self.net_fake_containment_delta <= SEGMENT_HARM_THRESHOLD
+                and not self.harmful_segments)
+
+    def headline(self) -> str:
+        sign = "+" if self.net_containment_delta >= 0 else ""
+        return (f"{self.change_description}: net containment "
+                f"{sign}{self.net_containment_delta*100:.1f}pt "
+                f"(true resolution {self.net_true_resolution_delta*100:+.1f}pt, "
+                f"fake {self.net_fake_containment_delta*100:+.1f}pt)")
+
+    def summary(self) -> str:
+        lines = [self.headline(), f"  verdict: {self.verdict}"]
+        if self.harmful_segments:
+            lines.append(f"  HARM: {len(self.harmful_segments)} segment(s) hurt; "
+                         f"worst = {self.worst_harm.label} "
+                         f"(containment {self.worst_harm.containment_delta*100:+.1f}pt, "
+                         f"agent {self.worst_harm.agent_delta*100:+.1f}pt)")
+        else:
+            lines.append("  HARM: none detected across evaluated segments")
+        if self.helped_segments:
+            top = max(self.helped_segments, key=lambda s: s.containment_delta)
+            lines.append(f"  best helped = {top.label} "
+                         f"(containment {top.containment_delta*100:+.1f}pt)")
+        return "\n".join(lines)

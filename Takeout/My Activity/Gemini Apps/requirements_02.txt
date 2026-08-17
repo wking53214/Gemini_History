@@ -1,0 +1,4 @@
+# The harness uses numpy for sampling and weighted choice. Nothing else.
+numpy
+# test-only:
+pytest

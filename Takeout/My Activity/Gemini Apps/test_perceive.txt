@@ -1,0 +1,492 @@
+"""
+PERCEIVE Test Suite
+===================
+
+Comprehensive policy evaluation and governance tests.
+"""
+
+import unittest
+from datetime import datetime, timezone
+from perceive_kernel import (
+    PerceiveGovernanceKernel,
+    PolicyRequest,
+    PolicyManifest,
+    ConsensusEngine,
+    PolicyOutput,
+    Provenance,
+    EventStore,
+    ManifestRegistry,
+)
+from policy_engine import (
+    EscalationPolicy,
+    RuleModificationPolicy,
+    DataExportPolicy,
+    EmergencyOverridePolicy,
+)
+from audit.immutable_ledger import ImmutableGovernanceLedger
+
+
+# ============================================================
+# UNIT TESTS: Policy Rules
+# ============================================================
+
+class TestEscalationPolicy(unittest.TestCase):
+    """Test escalation policy rules."""
+
+    def test_daily_limit_enforced(self):
+        """Daily escalation limit should be enforced."""
+        approved, violations = EscalationPolicy.can_escalate(
+            current_risk_tier="critical",
+            escalations_today=15,  # Exceeds limit
+            escalations_this_hour=1,
+            minutes_since_last_escalation=30,
+        )
+
+        self.assertFalse(approved)
+        self.assertGreater(len(violations), 0)
+
+    def test_hourly_limit_enforced(self):
+        """Hourly escalation limit should be enforced."""
+        approved, violations = EscalationPolicy.can_escalate(
+            current_risk_tier="critical",
+            escalations_today=5,
+            escalations_this_hour=4,  # Exceeds limit
+            minutes_since_last_escalation=30,
+        )
+
+        self.assertFalse(approved)
+
+    def test_cooldown_enforced(self):
+        """Cooldown period should be enforced."""
+        approved, violations = EscalationPolicy.can_escalate(
+            current_risk_tier="critical",
+            escalations_today=5,
+            escalations_this_hour=1,
+            minutes_since_last_escalation=5,  # Less than 15 min cooldown
+        )
+
+        self.assertFalse(approved)
+
+    def test_valid_escalation_approved(self):
+        """Valid escalation should be approved."""
+        approved, violations = EscalationPolicy.can_escalate(
+            current_risk_tier="critical",
+            escalations_today=3,
+            escalations_this_hour=1,
+            minutes_since_last_escalation=20,
+        )
+
+        self.assertTrue(approved)
+        self.assertEqual(len(violations), 0)
+
+
+class TestRuleModificationPolicy(unittest.TestCase):
+    """Test rule modification policy."""
+
+    def test_critical_rule_requires_dual_approval(self):
+        """Critical rules require 2 approvals."""
+        approved, violations = RuleModificationPolicy.can_modify(
+            rule_type="critical",
+            approval_count=1,  # Insufficient
+            hours_since_last_modification=25,
+        )
+
+        self.assertFalse(approved)
+
+    def test_critical_rule_enforces_temporal_lock(self):
+        """Critical rules have 24-hour temporal lock."""
+        approved, violations = RuleModificationPolicy.can_modify(
+            rule_type="critical",
+            approval_count=2,
+            hours_since_last_modification=12,  # Within lock period
+        )
+
+        self.assertFalse(approved)
+
+    def test_safety_critical_requires_consensus(self):
+        """Safety-critical rules require 3 approvals."""
+        approved, violations = RuleModificationPolicy.can_modify(
+            rule_type="safety_critical",
+            approval_count=2,
+            hours_since_last_modification=100,
+        )
+
+        self.assertFalse(approved)
+
+
+class TestDataExportPolicy(unittest.TestCase):
+    """Test data export policy."""
+
+    def test_pii_export_requires_consent(self):
+        """PII export requires patient consent."""
+        approved, violations = DataExportPolicy.can_export(
+            export_type="pii_included",
+            has_consent=False,
+            will_audit_log=True,
+            will_encrypt=True,
+        )
+
+        self.assertFalse(approved)
+
+    def test_pii_export_requires_encryption(self):
+        """PII export requires encryption."""
+        approved, violations = DataExportPolicy.can_export(
+            export_type="pii_included",
+            has_consent=True,
+            will_audit_log=True,
+            will_encrypt=False,
+        )
+
+        self.assertFalse(approved)
+
+    def test_synthetic_export_approved(self):
+        """Synthetic data export should be approved."""
+        approved, violations = DataExportPolicy.can_export(
+            export_type="synthetic_only",
+            has_consent=False,
+            will_audit_log=True,
+            will_encrypt=False,
+        )
+
+        self.assertTrue(approved)
+
+
+class TestEmergencyOverridePolicy(unittest.TestCase):
+    """Test emergency override policy."""
+
+    def test_patient_safety_override_allowed(self):
+        """Patient safety overrides should be allowed."""
+        approved, violations = EmergencyOverridePolicy.can_override(
+            override_type="patient_safety",
+            justification="Child's life at immediate risk",
+            has_physician_approval=True,
+            can_notify=True,
+        )
+
+        self.assertTrue(approved)
+
+    def test_regulatory_exception_not_allowed(self):
+        """Regulatory exceptions should NOT be allowed."""
+        approved, violations = EmergencyOverridePolicy.can_override(
+            override_type="regulatory_exception",
+            justification="Regulatory change",
+            has_physician_approval=True,
+            can_notify=True,
+        )
+
+        self.assertFalse(approved)
+
+    def test_override_requires_justification(self):
+        """Overrides require justification."""
+        approved, violations = EmergencyOverridePolicy.can_override(
+            override_type="patient_safety",
+            justification="",
+            has_physician_approval=True,
+            can_notify=True,
+        )
+
+        self.assertFalse(approved)
+
+
+# ============================================================
+# UNIT TESTS: Consensus Logic
+# ============================================================
+
+class TestConsensusEngine(unittest.TestCase):
+    """Test consensus decision logic."""
+
+    def test_all_gates_approved(self):
+        """All approved gates should result in approval."""
+        outputs = [
+            PolicyOutput(
+                gate_name="boundary",
+                approved=True,
+                confidence=0.95,
+                violation_details=[],
+                timestamp=datetime.now(timezone.utc),
+                provenance=Provenance("sys", "policy", "test"),
+            ),
+            PolicyOutput(
+                gate_name="sentinel",
+                approved=True,
+                confidence=0.90,
+                violation_details=[],
+                timestamp=datetime.now(timezone.utc),
+                provenance=Provenance("sys", "policy", "test"),
+            ),
+        ]
+
+        approved, confidence, violations = ConsensusEngine.evaluate(outputs)
+
+        self.assertTrue(approved)
+        self.assertEqual(len(violations), 0)
+
+    def test_single_gate_rejection_blocks_approval(self):
+        """One rejected gate should block approval."""
+        outputs = [
+            PolicyOutput(
+                gate_name="boundary",
+                approved=True,
+                confidence=0.95,
+                violation_details=[],
+                timestamp=datetime.now(timezone.utc),
+                provenance=Provenance("sys", "policy", "test"),
+            ),
+            PolicyOutput(
+                gate_name="sentinel",
+                approved=False,  # REJECTION
+                confidence=0.85,
+                violation_details=["Anomaly detected"],
+                timestamp=datetime.now(timezone.utc),
+                provenance=Provenance("sys", "policy", "test"),
+            ),
+        ]
+
+        approved, confidence, violations = ConsensusEngine.evaluate(outputs)
+
+        self.assertFalse(approved)
+        self.assertGreater(len(violations), 0)
+
+    def test_confidence_calculation(self):
+        """Confidence should be geometric mean of inputs."""
+        outputs = [
+            PolicyOutput(
+                gate_name="g1",
+                approved=True,
+                confidence=0.9,
+                violation_details=[],
+                timestamp=datetime.now(timezone.utc),
+                provenance=Provenance("sys", "policy", "test"),
+            ),
+            PolicyOutput(
+                gate_name="g2",
+                approved=True,
+                confidence=0.8,
+                violation_details=[],
+                timestamp=datetime.now(timezone.utc),
+                provenance=Provenance("sys", "policy", "test"),
+            ),
+        ]
+
+        approved, confidence, violations = ConsensusEngine.evaluate(outputs)
+
+        # Geometric mean of 0.9 and 0.8
+        expected = (0.9 * 0.8) ** 0.5
+        self.assertAlmostEqual(confidence, expected, places=5)
+
+
+# ============================================================
+# INTEGRATION TESTS: Full Policy Evaluation
+# ============================================================
+
+class TestPerceiveIntegration(unittest.TestCase):
+    """Integration tests with full kernel."""
+
+    def setUp(self):
+        """Set up test kernel."""
+        self.kernel = PerceiveGovernanceKernel()
+
+        # Register simple adapters
+        def always_approve_adapter(request):
+            return PolicyOutput(
+                gate_name="mock",
+                approved=True,
+                confidence=0.95,
+                violation_details=[],
+                timestamp=datetime.now(timezone.utc),
+                provenance=Provenance("sys", "mock", "test"),
+            )
+
+        self.kernel.register_adapter("boundary_gate", always_approve_adapter)
+
+        # Register manifest
+        manifest = PolicyManifest(
+            manifest_id="v1",
+            version="1.0.0",
+            created_at=datetime.now(timezone.utc),
+            policies={"test": {}},
+        )
+        self.kernel.register_manifest(manifest)
+
+    def test_valid_request_approved(self):
+        """Valid request should be approved."""
+        request = PolicyRequest(
+            request_id="REQ-001",
+            request_type="escalate_patient",
+            subject_id="P001",
+            actor_id="DR-001",
+            context={"severity": "high"},
+        )
+
+        verdict = self.kernel.evaluate_request(request)
+
+        self.assertTrue(verdict.approved)
+        self.assertIsNotNone(verdict.audit_hash)
+
+    def test_missing_manifest_rejected(self):
+        """Request without manifest should be rejected."""
+        kernel = PerceiveGovernanceKernel()  # No manifest registered
+
+        request = PolicyRequest(
+            request_id="REQ-001",
+            request_type="escalate_patient",
+            subject_id="P001",
+            actor_id="DR-001",
+            context={},
+        )
+
+        verdict = kernel.evaluate_request(request)
+
+        self.assertFalse(verdict.approved)
+
+
+# ============================================================
+# EVENT SOURCING TESTS
+# ============================================================
+
+class TestEventSourcing(unittest.TestCase):
+    """Test event sourcing capabilities."""
+
+    def test_event_store_append(self):
+        """Events should append to store."""
+        store = EventStore()
+
+        event = store.append_event(
+            event_type="policy_evaluation",
+            request_snapshot={"request_id": "REQ-001"},
+            actor_id="DR-001",
+        )
+
+        self.assertEqual(len(store.events), 1)
+        self.assertIsNotNone(event.event_id)
+
+    def test_event_replay(self):
+        """Should be able to replay events."""
+        store = EventStore()
+
+        for i in range(5):
+            store.append_event(
+                event_type="policy_evaluation",
+                request_snapshot={"request_id": f"REQ-{i}"},
+                actor_id=f"DR-{i}",
+            )
+
+        replayed = store.replay()
+        self.assertEqual(len(replayed), 5)
+
+
+# ============================================================
+# MANIFEST VERSIONING TESTS
+# ============================================================
+
+class TestManifestRegistry(unittest.TestCase):
+    """Test manifest versioning."""
+
+    def test_manifest_registration(self):
+        """Manifest should register."""
+        registry = ManifestRegistry()
+
+        manifest = PolicyManifest(
+            manifest_id="v1",
+            version="1.0.0",
+            created_at=datetime.now(timezone.utc),
+            policies={"policy1": {}},
+        )
+
+        registry.register_manifest(manifest)
+
+        retrieved = registry.get_current_manifest()
+        self.assertIsNotNone(retrieved)
+        self.assertEqual(retrieved.version, "1.0.0")
+
+    def test_manifest_versioning(self):
+        """Multiple manifest versions should be tracked."""
+        registry = ManifestRegistry()
+
+        m1 = PolicyManifest(
+            manifest_id="v1",
+            version="1.0.0",
+            created_at=datetime.now(timezone.utc),
+            policies={},
+        )
+        m2 = PolicyManifest(
+            manifest_id="v2",
+            version="1.1.0",
+            created_at=datetime.now(timezone.utc),
+            policies={},
+        )
+
+        registry.register_manifest(m1)
+        registry.register_manifest(m2)
+
+        self.assertEqual(registry.get_current_manifest().version, "1.1.0")
+        self.assertEqual(registry.get_manifest("1.0.0").version, "1.0.0")
+
+
+# ============================================================
+# AUDIT TRAIL TESTS
+# ============================================================
+
+class TestGovernanceAuditTrail(unittest.TestCase):
+    """Test governance audit trail."""
+
+    def setUp(self):
+        self.ledger = ImmutableGovernanceLedger()
+
+    def test_decision_logging(self):
+        """Policy decisions should be logged."""
+        entry = self.ledger.append_decision(
+            request_id="REQ-001",
+            actor_id="DR-001",
+            request_type="escalate_patient",
+            evaluated_gates=["boundary", "sentinel"],
+            policy_outputs=[],
+            final_verdict={"approved": True, "confidence": 0.92},
+            manifest_version="1.0.0",
+            manifest_hash="abc123",
+        )
+
+        self.assertIsNotNone(entry.immutable_hash)
+        self.assertEqual(entry.request_id, "REQ-001")
+
+    def test_chain_integrity(self):
+        """Chain should verify as valid."""
+        for i in range(5):
+            self.ledger.append_decision(
+                request_id=f"REQ-{i}",
+                actor_id="DR-001",
+                request_type="escalate_patient",
+                evaluated_gates=["boundary"],
+                policy_outputs=[],
+                final_verdict={"approved": True},
+                manifest_version="1.0.0",
+                manifest_hash="abc123",
+            )
+
+        is_valid = self.ledger.verify_chain_integrity()
+        self.assertTrue(is_valid)
+
+    def test_actor_query(self):
+        """Should query decisions by actor."""
+        for i in range(3):
+            self.ledger.append_decision(
+                request_id=f"REQ-{i}",
+                actor_id="DR-001",
+                request_type="escalate_patient",
+                evaluated_gates=[],
+                policy_outputs=[],
+                final_verdict={"approved": True},
+                manifest_version="1.0.0",
+                manifest_hash="abc123",
+            )
+
+        decisions = self.ledger.query_actor("DR-001")
+        self.assertEqual(len(decisions), 3)
+
+
+# ============================================================
+# TEST RUNNER
+# ============================================================
+
+if __name__ == "__main__":
+    unittest.main()

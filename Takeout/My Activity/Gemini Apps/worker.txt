@@ -1,0 +1,163 @@
+"""
+Worker Pool
+===========
+
+Async workers that execute heavy engine jobs from the queue.
+Handles retries, error recovery, reconciliation.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import datetime, timezone
+from typing import Callable, List, Optional
+
+logger = logging.getLogger("OBSERVE_WORKER")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(
+        "[OBSERVE_WORKER] %(asctime)s %(levelname)s %(message)s"
+    ))
+    logger.addHandler(handler)
+
+
+# ============================================================
+# WORKER
+# ============================================================
+
+class Worker:
+    """Single async worker that processes queued jobs."""
+
+    def __init__(
+        self,
+        worker_id: str,
+        job_queue,
+        engine_executor: Callable,
+        provisional_store,
+    ):
+        self.worker_id = worker_id
+        self.job_queue = job_queue
+        self.engine_executor = engine_executor  # Async function that runs engine
+        self.provisional_store = provisional_store
+        self.is_running = False
+        self.jobs_processed = 0
+
+    async def run(self) -> None:
+        """Main worker loop: process jobs until stopped."""
+        self.is_running = True
+        logger.info(f"Worker {self.worker_id} started")
+
+        while self.is_running:
+            try:
+                # Wait for job with timeout
+                job = await self.job_queue.dequeue_blocking(timeout=5.0)
+
+                if job is None:
+                    continue
+
+                await self._process_job(job)
+                self.jobs_processed += 1
+
+            except Exception as e:
+                logger.error(f"Worker {self.worker_id} error: {e}")
+                await asyncio.sleep(1)
+
+        logger.info(f"Worker {self.worker_id} stopped ({self.jobs_processed} jobs processed)")
+
+    async def _process_job(self, job) -> None:
+        """Execute a single job."""
+        logger.info(f"Worker {self.worker_id} processing job {job.job_id}")
+
+        self.job_queue.mark_running(job.job_id)
+
+        try:
+            # Execute the heavy engine
+            result = await self.engine_executor(
+                engine_name=job.engine_name,
+                vitals=job.vitals_snapshot,
+            )
+
+            # Mark completed
+            self.job_queue.mark_completed(job.job_id, result)
+
+            # Reconcile provisional verdict
+            self.provisional_store.reconcile(job.patient_id, result)
+
+            logger.info(f"Job {job.job_id} completed successfully")
+
+        except Exception as e:
+            logger.error(f"Job {job.job_id} execution failed: {e}")
+            self.job_queue.mark_failed(job.job_id, str(e))
+
+    def stop(self) -> None:
+        """Stop the worker."""
+        self.is_running = False
+
+
+# ============================================================
+# WORKER POOL
+# ============================================================
+
+class WorkerPool:
+    """Manages multiple async workers."""
+
+    def __init__(
+        self,
+        num_workers: int,
+        job_queue,
+        engine_executor: Callable,
+        provisional_store,
+    ):
+        self.num_workers = num_workers
+        self.job_queue = job_queue
+        self.engine_executor = engine_executor
+        self.provisional_store = provisional_store
+        self.workers: List[Worker] = []
+        self.tasks: List[asyncio.Task] = []
+
+    async def start(self) -> None:
+        """Start all workers."""
+        logger.info(f"Starting worker pool with {self.num_workers} workers")
+
+        for i in range(self.num_workers):
+            worker = Worker(
+                worker_id=f"worker-{i}",
+                job_queue=self.job_queue,
+                engine_executor=self.engine_executor,
+                provisional_store=self.provisional_store,
+            )
+            self.workers.append(worker)
+
+            # Create async task for worker
+            task = asyncio.create_task(worker.run())
+            self.tasks.append(task)
+
+    async def stop(self) -> None:
+        """Stop all workers."""
+        logger.info("Stopping worker pool")
+
+        for worker in self.workers:
+            worker.stop()
+
+        # Wait for all tasks to complete
+        await asyncio.gather(*self.tasks, return_exceptions=True)
+
+        logger.info(f"Worker pool stopped ({sum(w.jobs_processed for w in self.workers)} total jobs)")
+
+    def get_stats(self) -> dict:
+        """Get pool statistics."""
+        return {
+            "num_workers": self.num_workers,
+            "total_jobs_processed": sum(w.jobs_processed for w in self.workers),
+            "queue_size": self.job_queue.queue_size() if self.job_queue.queue else 0,
+            "workers": [
+                {
+                    "worker_id": w.worker_id,
+                    "is_running": w.is_running,
+                    "jobs_processed": w.jobs_processed,
+                }
+                for w in self.workers
+            ],
+        }

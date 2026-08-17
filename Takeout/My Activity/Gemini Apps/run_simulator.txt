@@ -1,0 +1,78 @@
+"""
+run_simulator.py — Demonstrate the honest-measurement simulator.
+
+Shows three changes against the reference tree:
+  1. a clean win (push the agent option last),
+  2. a marginal change (lead with a self-serve option),
+  3. a FALSE WIN / landmine (raise containment by trapping callers in a fake-
+     containment dead-end) — to show the simulator refusing to call it an
+     improvement even though the top-line number looks great.
+
+The point: the net number is never the whole story.
+"""
+
+from __future__ import annotations
+
+from reference_tree import build_reference_tree
+from caller_model import PopulationGenerator, PopulationConfig
+from ivr_tree import Node, NodeKind
+from simulator import Simulator, push_option_last, lead_with
+
+
+def _trap_dispute(tree):
+    """A change that raises overall containment by routing dispute failures to a
+    'we filed it, goodbye' dead-end and removing the agent escape. Looks like a big
+    win; actually traps callers unresolved."""
+    t = tree.clone()
+    t.nodes["dispute_deadend"] = Node("dispute_deadend", NodeKind.SELF_SERVE,
+        prompt="We have filed your dispute. Goodbye.", resolve_prob=0.0, next_on_fail=None)
+    t.node("dispute_action").next_on_fail = "dispute_deadend"
+    n = t.node("dispute_menu")
+    n.options = [o for o in n.options if o.target_id != "agent"]
+    return t
+
+
+def show(r):
+    print(r.summary())
+    # show the worst few segments so the distribution is visible
+    print("    per-segment (worst first):")
+    for s in r.segment_effects[:5]:
+        tag = "HARMED" if s.is_harmed else ("helped" if s.is_helped else "")
+        print(f"      {s.label:22} containment {s.containment_delta*100:+5.1f}pt | "
+              f"agent {s.agent_delta*100:+5.1f}pt | fake {s.fake_containment_delta*100:+5.1f}pt  {tag}")
+    print()
+
+
+def main():
+    pop = PopulationGenerator(PopulationConfig(n=12000, seed=11)).generate()
+    observed = {c.caller_id: c.observed() for c in pop}
+    tree = build_reference_tree()
+    sim = Simulator(seed=11)
+
+    print("=" * 74)
+    print("SIMULATOR — whole-population effect of proposed IVR changes")
+    print("(net is the headline; the distribution and harm sit right beside it)")
+    print("=" * 74, "\n")
+
+    print(">>> Change 1: push the agent option to the end of the main menu")
+    show(sim.measure(tree, push_option_last("entry", "agent"), pop, observed,
+                     "push agent option last"))
+
+    print(">>> Change 2: lead the main menu with the balance self-serve option")
+    show(sim.measure(tree, lead_with("entry", "balance"), pop, observed,
+                     "lead with balance"))
+
+    print(">>> Change 3: reroute dispute failures to a 'handled, goodbye' dead-end")
+    print("    (raises the top-line containment number — watch the verdict)")
+    show(sim.measure(tree, _trap_dispute, pop, observed,
+                     "reroute dispute failures to dead-end"))
+
+    print("=" * 74)
+    print("Change 3 raises containment the most on the top line, and is the WORST")
+    print("change of the three: it traps callers in unresolved self-service. A")
+    print("simulator that watched only net containment would have recommended it.")
+    print("=" * 74)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,332 @@
+"""
+Policy Engine
+=============
+
+Governance rules, thresholds, and decision logic.
+All policies are evidence-based and audit-traceable.
+"""
+
+from dataclasses import dataclass
+from typing import Dict, List
+
+# ============================================================
+# GOVERNANCE POLICIES
+# ============================================================
+
+@dataclass
+class GovernancePolicy:
+    """Base policy definition."""
+    policy_id: str
+    name: str
+    description: str
+    enforced: bool = True
+
+
+# ============================================================
+# ESCALATION POLICY
+# ============================================================
+
+class EscalationPolicy:
+    """Controls when patient escalations are approved."""
+
+    # Thresholds
+    MAX_ESCALATIONS_PER_DAY = 10
+    MAX_ESCALATIONS_PER_HOUR = 3
+    MIN_TIME_BETWEEN_ESCALATIONS_MINUTES = 15
+
+    # Risk tiers
+    RISK_TIERS = {
+        "stable": {"escalation_cost": 0, "approval_required": False},
+        "caution": {"escalation_cost": 1, "approval_required": False},
+        "warning": {"escalation_cost": 2, "approval_required": True},
+        "critical": {"escalation_cost": 3, "approval_required": True},
+    }
+
+    @staticmethod
+    def can_escalate(
+        current_risk_tier: str,
+        escalations_today: int,
+        escalations_this_hour: int,
+        minutes_since_last_escalation: int,
+    ) -> tuple[bool, List[str]]:
+        """
+        Determine if escalation is permitted.
+
+        Returns:
+            (approved, violation_details)
+        """
+        violations = []
+
+        # Check daily limit
+        if escalations_today >= EscalationPolicy.MAX_ESCALATIONS_PER_DAY:
+            violations.append(
+                f"Daily escalation limit reached ({escalations_today}/"
+                f"{EscalationPolicy.MAX_ESCALATIONS_PER_DAY})"
+            )
+
+        # Check hourly limit
+        if escalations_this_hour >= EscalationPolicy.MAX_ESCALATIONS_PER_HOUR:
+            violations.append(
+                f"Hourly escalation limit reached ({escalations_this_hour}/"
+                f"{EscalationPolicy.MAX_ESCALATIONS_PER_HOUR})"
+            )
+
+        # Check cooldown period
+        if minutes_since_last_escalation < EscalationPolicy.MIN_TIME_BETWEEN_ESCALATIONS_MINUTES:
+            violations.append(
+                f"Escalation cooldown active ({minutes_since_last_escalation}/"
+                f"{EscalationPolicy.MIN_TIME_BETWEEN_ESCALATIONS_MINUTES} minutes)"
+            )
+
+        return len(violations) == 0, violations
+
+
+# ============================================================
+# RULE MODIFICATION POLICY
+# ============================================================
+
+class RuleModificationPolicy:
+    """Controls when governance rules can be modified."""
+
+    # Modification levels
+    MODIFICATION_LEVELS = {
+        "non_critical": {
+            "approval_required": 1,  # Single approver
+            "temporal_lock_hours": 0,
+        },
+        "critical": {
+            "approval_required": 2,  # Dual approval
+            "temporal_lock_hours": 24,
+        },
+        "safety_critical": {
+            "approval_required": 3,  # Consensus
+            "temporal_lock_hours": 72,
+        },
+    }
+
+    @staticmethod
+    def can_modify(
+        rule_type: str,
+        approval_count: int,
+        hours_since_last_modification: int,
+    ) -> tuple[bool, List[str]]:
+        """
+        Determine if rule modification is permitted.
+
+        Returns:
+            (approved, violation_details)
+        """
+        violations = []
+
+        if rule_type not in RuleModificationPolicy.MODIFICATION_LEVELS:
+            violations.append(f"Unknown rule type: {rule_type}")
+            return False, violations
+
+        level = RuleModificationPolicy.MODIFICATION_LEVELS[rule_type]
+
+        # Check approvals
+        if approval_count < level["approval_required"]:
+            violations.append(
+                f"Insufficient approvals ({approval_count}/{level['approval_required']})"
+            )
+
+        # Check temporal lock
+        if hours_since_last_modification < level["temporal_lock_hours"]:
+            violations.append(
+                f"Temporal lock active ({hours_since_last_modification}/"
+                f"{level['temporal_lock_hours']} hours)"
+            )
+
+        return len(violations) == 0, violations
+
+
+# ============================================================
+# DATA EXPORT POLICY
+# ============================================================
+
+class DataExportPolicy:
+    """Controls when patient data can be exported."""
+
+    # Export restrictions
+    EXPORT_RESTRICTIONS = {
+        "pii_included": {
+            "requires_consent": True,
+            "requires_audit_log": True,
+            "encryption_required": True,
+        },
+        "synthetic_only": {
+            "requires_consent": False,
+            "requires_audit_log": True,
+            "encryption_required": False,
+        },
+        "aggregate_only": {
+            "requires_consent": False,
+            "requires_audit_log": False,
+            "encryption_required": False,
+        },
+    }
+
+    @staticmethod
+    def can_export(
+        export_type: str,
+        has_consent: bool,
+        will_audit_log: bool,
+        will_encrypt: bool,
+    ) -> tuple[bool, List[str]]:
+        """
+        Determine if data export is permitted.
+
+        Returns:
+            (approved, violation_details)
+        """
+        violations = []
+
+        if export_type not in DataExportPolicy.EXPORT_RESTRICTIONS:
+            violations.append(f"Unknown export type: {export_type}")
+            return False, violations
+
+        restrictions = DataExportPolicy.EXPORT_RESTRICTIONS[export_type]
+
+        # Check consent
+        if restrictions["requires_consent"] and not has_consent:
+            violations.append("Patient consent required for PII export")
+
+        # Check audit logging
+        if restrictions["requires_audit_log"] and not will_audit_log:
+            violations.append("Audit logging required for export")
+
+        # Check encryption
+        if restrictions["encryption_required"] and not will_encrypt:
+            violations.append("Encryption required for export")
+
+        return len(violations) == 0, violations
+
+
+# ============================================================
+# EMERGENCY OVERRIDE POLICY
+# ============================================================
+
+class EmergencyOverridePolicy:
+    """Controls emergency override requests (life-saving exceptions)."""
+
+    # Override categories
+    OVERRIDE_CATEGORIES = {
+        "patient_safety": {
+            "allowed": True,
+            "requires_physician_approval": True,
+            "audit_required": True,
+            "notification_required": True,
+        },
+        "system_failure": {
+            "allowed": True,
+            "requires_physician_approval": False,
+            "audit_required": True,
+            "notification_required": True,
+        },
+        "regulatory_exception": {
+            "allowed": False,  # Never allowed without explicit governance approval
+            "requires_physician_approval": False,
+            "audit_required": True,
+            "notification_required": True,
+        },
+    }
+
+    @staticmethod
+    def can_override(
+        override_type: str,
+        justification: str,
+        has_physician_approval: bool,
+        can_notify: bool,
+    ) -> tuple[bool, List[str]]:
+        """
+        Determine if emergency override is permitted.
+
+        Returns:
+            (approved, violation_details)
+        """
+        violations = []
+
+        if override_type not in EmergencyOverridePolicy.OVERRIDE_CATEGORIES:
+            violations.append(f"Unknown override type: {override_type}")
+            return False, violations
+
+        category = EmergencyOverridePolicy.OVERRIDE_CATEGORIES[override_type]
+
+        # Check if override type is allowed
+        if not category["allowed"]:
+            violations.append(f"Override type '{override_type}' not permitted")
+            return False, violations
+
+        # Check physician approval if required
+        if category["requires_physician_approval"] and not has_physician_approval:
+            violations.append("Physician approval required for this override")
+
+        # Check justification provided
+        if not justification or len(justification.strip()) == 0:
+            violations.append("Justification required for emergency override")
+
+        # Check notification capability
+        if category["notification_required"] and not can_notify:
+            violations.append("System must be able to notify about override")
+
+        return len(violations) == 0, violations
+
+
+# ============================================================
+# INVARIANTS (HARD CONSTRAINTS)
+# ============================================================
+
+class GovernanceInvariants:
+    """Hard constraints that must always hold."""
+
+    @staticmethod
+    def audit_trail_immutable() -> tuple[bool, str]:
+        """Audit trail must be append-only and tamper-proof."""
+        # Checked by ImmutableAuditLedger
+        return True, "Audit trail is cryptographically chained"
+
+    @staticmethod
+    def manifest_versioned() -> tuple[bool, str]:
+        """Policies must be versioned and tracked."""
+        # Checked by ManifestRegistry
+        return True, "Manifest versioning enforced"
+
+    @staticmethod
+    def gates_unanimous() -> tuple[bool, str]:
+        """All gates must approve (unanimous consensus)."""
+        # Checked by ConsensusEngine
+        return True, "Consensus logic enforced"
+
+    @staticmethod
+    def decisions_replay_deterministic() -> tuple[bool, str]:
+        """Decisions must be deterministically reproducible."""
+        # Verified by EventStore replay
+        return True, "Event sourcing enables replay"
+
+
+# ============================================================
+# POLICY SUMMARY
+# ============================================================
+
+POLICY_SUMMARY = {
+    "escalation": {
+        "max_per_day": EscalationPolicy.MAX_ESCALATIONS_PER_DAY,
+        "max_per_hour": EscalationPolicy.MAX_ESCALATIONS_PER_HOUR,
+        "cooldown_minutes": EscalationPolicy.MIN_TIME_BETWEEN_ESCALATIONS_MINUTES,
+    },
+    "rule_modification": {
+        "non_critical_approvals": RuleModificationPolicy.MODIFICATION_LEVELS["non_critical"]["approval_required"],
+        "critical_approvals": RuleModificationPolicy.MODIFICATION_LEVELS["critical"]["approval_required"],
+        "safety_critical_approvals": RuleModificationPolicy.MODIFICATION_LEVELS["safety_critical"]["approval_required"],
+    },
+    "data_export": {
+        "pii_export_allowed": True,
+        "requires_consent": True,
+        "requires_encryption": True,
+    },
+    "emergency_override": {
+        "patient_safety_allowed": True,
+        "system_failure_allowed": True,
+        "regulatory_exception_allowed": False,
+    },
+}

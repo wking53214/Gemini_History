@@ -1,0 +1,133 @@
+"""
+Drift Detection Adapter
+=======================
+
+Detects if the patient's baseline vital signs have shifted,
+indicating model degradation or fundamental patient change.
+Watches for systematic bias in predictions.
+"""
+
+from datetime import datetime, timezone
+from observe_engine import RiskOutput
+from clinical_policy import DriftThresholds
+
+
+def drift_detection_adapter(vitals) -> RiskOutput:
+    """
+    Detect shifts in patient baseline vitals (model drift).
+
+    Args:
+        vitals: VitalsSnapshot (with historical baseline context)
+
+    Returns:
+        RiskOutput indicating drift confidence and direction
+    """
+
+    triggered_rules = []
+    risk_score = 0.0
+
+    # Extract baseline from context
+    baseline_o2 = vitals.context.get("baseline_o2")
+    baseline_hr = vitals.context.get("baseline_hr")
+    baseline_rr = vitals.context.get("baseline_rr")
+    baseline_temp = vitals.context.get("baseline_temp")
+
+    if not any([baseline_o2, baseline_hr, baseline_rr, baseline_temp]):
+        return RiskOutput(
+            engine_name="drift_detection",
+            risk_score=0.0,
+            confidence=0.2,
+            regime_classification={"stable": 1.0},
+            triggered_rules=["No baseline established yet"],
+            timestamp=datetime.now(timezone.utc),
+        )
+
+    # Check for O2 drift
+    if baseline_o2 is not None:
+        o2_shift = abs(vitals.oxygen_saturation - baseline_o2)
+        if o2_shift > DriftThresholds.o2_sat_drift:
+            triggered_rules.append(
+                f"O2_BASELINE_SHIFT: {o2_shift:.1f}% from baseline "
+                f"({baseline_o2:.1f} → {vitals.oxygen_saturation:.1f})"
+            )
+            risk_score += 0.2
+            if vitals.oxygen_saturation < baseline_o2:
+                risk_score += 0.2  # Downward drift is more concerning
+
+    # Check for HR drift
+    if baseline_hr is not None:
+        hr_shift = abs(vitals.heart_rate - baseline_hr)
+        if hr_shift > DriftThresholds.hr_drift:
+            triggered_rules.append(
+                f"HR_BASELINE_SHIFT: {hr_shift:.0f} bpm from baseline "
+                f"({baseline_hr:.0f} → {vitals.heart_rate:.0f})"
+            )
+            risk_score += 0.15
+            if vitals.heart_rate > baseline_hr:
+                risk_score += 0.15  # Upward drift is more concerning
+
+    # Check for RR drift
+    if baseline_rr is not None:
+        rr_shift = abs(vitals.respiratory_rate - baseline_rr)
+        if rr_shift > DriftThresholds.rr_drift:
+            triggered_rules.append(
+                f"RR_BASELINE_SHIFT: {rr_shift:.0f} breaths/min from baseline "
+                f"({baseline_rr:.0f} → {vitals.respiratory_rate:.0f})"
+            )
+            risk_score += 0.15
+            if vitals.respiratory_rate > baseline_rr:
+                risk_score += 0.1
+
+    # Check for temp drift
+    if baseline_temp is not None:
+        temp_shift = abs(vitals.temperature - baseline_temp)
+        if temp_shift > DriftThresholds.temp_drift:
+            triggered_rules.append(
+                f"TEMP_BASELINE_SHIFT: {temp_shift:.1f}°C from baseline "
+                f"({baseline_temp:.1f} → {vitals.temperature:.1f})"
+            )
+            risk_score += 0.1
+            if vitals.temperature < baseline_temp:
+                risk_score += 0.15  # Hypothermia drift is more concerning
+
+    # Multi-parameter drift (all changing together)
+    drift_count = sum([
+        baseline_o2 is not None and abs(vitals.oxygen_saturation - baseline_o2) > DriftThresholds.o2_sat_drift,
+        baseline_hr is not None and abs(vitals.heart_rate - baseline_hr) > DriftThresholds.hr_drift,
+        baseline_rr is not None and abs(vitals.respiratory_rate - baseline_rr) > DriftThresholds.rr_drift,
+        baseline_temp is not None and abs(vitals.temperature - baseline_temp) > DriftThresholds.temp_drift,
+    ])
+
+    if drift_count >= 3:
+        triggered_rules.append(
+            f"SYSTEMIC_DRIFT: {drift_count}/4 parameters shifted from baseline "
+            "(indicates fundamental patient change or model miscalibration)"
+        )
+        risk_score += 0.2
+
+    # Cap and normalize
+    risk_score = min(risk_score, 1.0)
+
+    # Confidence: higher if multiple drifts detected
+    confidence = 0.6 + (0.3 * (drift_count / 4.0))
+
+    regime_probs = {
+        "stable": max(0, 1.0 - risk_score * 0.5),
+        "caution": min(0.6, risk_score * 0.6),
+        "warning": min(0.3, risk_score * 0.3),
+        "critical": 0.0,  # Drift itself doesn't cause immediate criticality
+    }
+
+    # Normalize
+    total = sum(regime_probs.values())
+    if total > 0:
+        regime_probs = {k: v / total for k, v in regime_probs.items()}
+
+    return RiskOutput(
+        engine_name="drift_detection",
+        risk_score=risk_score,
+        confidence=confidence,
+        regime_classification=regime_probs,
+        triggered_rules=triggered_rules,
+        timestamp=datetime.now(timezone.utc),
+    )

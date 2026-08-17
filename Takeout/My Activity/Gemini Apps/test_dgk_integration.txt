@@ -1,0 +1,265 @@
+"""
+DGK Integration Tests
+=====================
+
+Test multi-node consensus for critical governance decisions.
+"""
+
+import unittest
+import secrets
+from datetime import datetime, timezone
+from dgk_integration import (
+    Proposal,
+    Signer,
+    cluster_proposals,
+    l1_distance,
+    ConsensusDecider,
+    GovernanceNode,
+    DGKGateway,
+    DGKAwareVerdict,
+)
+
+
+class TestSigning(unittest.TestCase):
+    """Test HMAC signing."""
+
+    def setUp(self):
+        self.key = secrets.token_bytes(32)
+        self.payload = {
+            "node_id": "node-1",
+            "decision": {"approved": True},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def test_sign_and_verify(self):
+        """Signature should verify."""
+        sig = Signer.sign(self.payload, self.key)
+        self.assertIsNotNone(sig)
+        self.assertEqual(len(sig), 64)  # SHA256 hex
+
+    def test_verify_with_correct_key(self):
+        """Verification should pass with correct key."""
+        payload_with_sig = dict(self.payload)
+        payload_with_sig["_sig"] = Signer.sign(payload_with_sig, self.key)
+
+        self.assertTrue(Signer.verify(payload_with_sig, self.key))
+
+    def test_verify_fails_with_wrong_key(self):
+        """Verification should fail with wrong key."""
+        payload_with_sig = dict(self.payload)
+        payload_with_sig["_sig"] = Signer.sign(payload_with_sig, self.key)
+
+        wrong_key = secrets.token_bytes(32)
+        self.assertFalse(Signer.verify(payload_with_sig, wrong_key))
+
+
+class TestProposal(unittest.TestCase):
+    """Test proposal creation and signing."""
+
+    def setUp(self):
+        self.key = secrets.token_bytes(32)
+        self.decision = {"approved": True, "justification": "Emergency override"}
+
+    def test_proposal_creation(self):
+        """Proposal should serialize."""
+        proposal = Proposal(
+            node_id="hospital-1",
+            decision=self.decision,
+        )
+
+        data = proposal.to_dict()
+        self.assertEqual(data["node_id"], "hospital-1")
+        self.assertEqual(data["decision"], self.decision)
+
+    def test_proposal_signing(self):
+        """Proposal should sign."""
+        proposal = Proposal(
+            node_id="hospital-1",
+            decision=self.decision,
+        )
+
+        proposal.sign(self.key)
+        self.assertIsNotNone(proposal.signature)
+        self.assertEqual(len(proposal.signature), 64)
+
+
+class TestClustering(unittest.TestCase):
+    """Test proposal clustering."""
+
+    def test_identical_decisions_cluster(self):
+        """Identical decisions should cluster."""
+        decision = {"approved": True, "confidence": 0.92}
+
+        proposals = [
+            Proposal(f"node-{i}", decision)
+            for i in range(3)
+        ]
+
+        clusters = cluster_proposals(proposals, eps=1e-6)
+
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual(len(clusters[0]), 3)
+
+    def test_dissimilar_decisions_separate(self):
+        """Dissimilar decisions should separate."""
+        proposals = [
+            Proposal("node-1", {"approved": True, "confidence": 0.9}),
+            Proposal("node-2", {"approved": False, "confidence": 0.8}),
+            Proposal("node-3", {"approved": True, "confidence": 0.85}),
+        ]
+
+        clusters = cluster_proposals(proposals, eps=0.01)
+
+        # Should have multiple clusters due to approved mismatch
+        self.assertGreaterEqual(len(clusters), 2)
+
+    def test_l1_distance(self):
+        """L1 distance should measure differences."""
+        a = {"score": 0.5, "confidence": 0.9}
+        b = {"score": 0.55, "confidence": 0.85}
+
+        dist = l1_distance(a, b)
+        self.assertGreater(dist, 0)
+        self.assertLess(dist, 0.2)
+
+
+class TestConsensus(unittest.TestCase):
+    """Test consensus reaching."""
+
+    def setUp(self):
+        self.keys = {
+            "node-1": secrets.token_bytes(32),
+            "node-2": secrets.token_bytes(32),
+            "node-3": secrets.token_bytes(32),
+        }
+        self.consensus = ConsensusDecider(quorum_fraction=2/3)
+
+    def test_consensus_with_quorum(self):
+        """Consensus should succeed with quorum."""
+        decision = {"approved": True, "confidence": 0.92}
+
+        proposals = []
+        for node_id, key in self.keys.items():
+            p = Proposal(node_id, decision)
+            p.sign(key)
+            proposals.append(p)
+
+        result = self.consensus.decide(proposals, self.keys)
+
+        self.assertEqual(result["consensus_size"], 3)
+        self.assertEqual(result["total_proposals"], 3)
+
+    def test_consensus_fails_without_quorum(self):
+        """Consensus should fail without quorum."""
+        proposals = [
+            Proposal("node-1", {"approved": True}),
+        ]
+
+        p = proposals[0]
+        p.sign(self.keys["node-1"])
+
+        with self.assertRaises(RuntimeError) as ctx:
+            self.consensus.decide(proposals, {"node-1": self.keys["node-1"]})
+
+        self.assertIn("quorum", str(ctx.exception).lower())
+
+    def test_consensus_handles_dissent(self):
+        """Consensus should work with one dissenting node."""
+        proposals = [
+            Proposal("node-1", {"approved": True, "confidence": 0.92}),
+            Proposal("node-2", {"approved": True, "confidence": 0.92}),
+            Proposal("node-3", {"approved": False, "confidence": 0.8}),  # Dissent
+        ]
+
+        for node_id, proposal in zip(self.keys.keys(), proposals):
+            proposal.sign(self.keys[node_id])
+
+        result = self.consensus.decide(proposals, self.keys)
+
+        # 2/3 agreed (quorum reached)
+        self.assertEqual(result["consensus_size"], 2)
+
+
+class TestGovernanceNode(unittest.TestCase):
+    """Test governance node proposal creation."""
+
+    def setUp(self):
+        self.node = GovernanceNode("hospital-1", secrets.token_bytes(32))
+
+    def test_node_propose(self):
+        """Node should create signed proposal."""
+        decision = {"approved": True, "reason": "Emergency"}
+
+        proposal = self.node.propose(decision)
+
+        self.assertEqual(proposal.node_id, "hospital-1")
+        self.assertEqual(proposal.decision, decision)
+        self.assertIsNotNone(proposal.signature)
+
+
+class TestDGKGateway(unittest.TestCase):
+    """Test DGK gateway integration."""
+
+    def setUp(self):
+        self.nodes = {
+            "hospital-1": GovernanceNode("hospital-1", secrets.token_bytes(32)),
+            "hospital-2": GovernanceNode("hospital-2", secrets.token_bytes(32)),
+            "hospital-3": GovernanceNode("hospital-3", secrets.token_bytes(32)),
+        }
+        self.consensus = ConsensusDecider(quorum_fraction=2/3)
+        self.gateway = DGKGateway(self.nodes, self.consensus)
+
+    def test_regular_escalation_no_consensus(self):
+        """Regular escalations should not require consensus."""
+        self.assertFalse(
+            self.gateway.require_consensus("escalate_patient", {})
+        )
+
+    def test_emergency_override_requires_consensus(self):
+        """Emergency overrides should require consensus."""
+        self.assertTrue(
+            self.gateway.require_consensus("emergency_override", {})
+        )
+
+    def test_critical_rule_change_requires_consensus(self):
+        """Critical rule changes should require consensus."""
+        self.assertTrue(
+            self.gateway.require_consensus("modify_critical_rule", {})
+        )
+
+    def test_consensus_workflow(self):
+        """Full consensus workflow should work."""
+        decision_data = {
+            "emergency_reason": "Life-threatening",
+            "justification": "Patient deteriorating",
+        }
+
+        result = self.gateway.reach_consensus("emergency_override", decision_data)
+
+        self.assertEqual(result["consensus_size"], 3)
+        self.assertIsNotNone(result["leader_node"])
+
+    def test_dgk_aware_verdict(self):
+        """Verdict should include consensus info."""
+        decision_data = {
+            "emergency_reason": "Life-threatening",
+        }
+
+        consensus_result = self.gateway.reach_consensus(
+            "emergency_override",
+            decision_data
+        )
+
+        verdict = DGKAwareVerdict(
+            request_id="REQ-OVERRIDE-001",
+            approved=True,
+            confidence=0.95,
+            consensus_result=consensus_result,
+        )
+
+        self.assertTrue(verdict.is_consensus_decision)
+        self.assertIsNotNone(verdict.consensus_result)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,144 @@
+"""
+Bayesian Fusion Adapter
+=======================
+
+Probabilistic risk assessment using Bayesian methods.
+Combines prior beliefs with observed evidence.
+Heavy compute, selected when entropy/velocity high.
+"""
+
+from datetime import datetime, timezone
+from observe_engine import RiskOutput
+
+
+def bayesian_fusion_adapter(vitals) -> RiskOutput:
+    """
+    Bayesian probabilistic risk assessment.
+
+    Prior: Base rate of critical events in pediatric population
+    Likelihood: How likely observed vitals are under each regime
+    Posterior: Updated belief about current regime
+
+    Args:
+        vitals: VitalsSnapshot
+
+    Returns:
+        RiskOutput with probabilistic risk_score
+    """
+
+    # Simplified Bayesian model
+    # P(regime | vitals) ∝ P(vitals | regime) * P(regime)
+
+    # Priors (base rates from epidemiology)
+    prior_stable = 0.90
+    prior_caution = 0.07
+    prior_warning = 0.02
+    prior_critical = 0.01
+
+    # Likelihoods: P(observed_vitals | regime)
+    # Computed from distance from regime-specific normal values
+
+    # Normal ranges for toddler (age 12-36 months)
+    o2_normal = (95, 100)
+    hr_normal = (80, 130)
+    rr_normal = (20, 40)
+    temp_normal = (36.5, 37.5)
+
+    def z_score(value, normal_range):
+        """Calculate z-score from normal range."""
+        mid = (normal_range[0] + normal_range[1]) / 2
+        spread = (normal_range[1] - normal_range[0]) / 4  # ±2 SD
+        return abs(value - mid) / spread if spread > 0 else 0
+
+    z_o2 = z_score(vitals.oxygen_saturation, o2_normal)
+    z_hr = z_score(vitals.heart_rate, hr_normal)
+    z_rr = z_score(vitals.respiratory_rate, rr_normal)
+    z_temp = z_score(vitals.temperature, temp_normal)
+
+    # Likelihood ratios (simplified exponential model)
+    import math
+
+    # P(vitals | stable) - low z-scores
+    likelihood_stable = (
+        math.exp(-0.5 * z_o2**2) *
+        math.exp(-0.5 * z_hr**2) *
+        math.exp(-0.5 * z_rr**2) *
+        math.exp(-0.5 * z_temp**2)
+    )
+
+    # P(vitals | caution) - moderate z-scores
+    likelihood_caution = (
+        math.exp(-0.3 * z_o2**2) *
+        math.exp(-0.3 * z_hr**2) *
+        math.exp(-0.3 * z_rr**2) *
+        math.exp(-0.3 * z_temp**2)
+    ) * 0.7
+
+    # P(vitals | warning) - high z-scores
+    likelihood_warning = (
+        math.exp(-0.1 * max(z_o2, 3)**2) *
+        math.exp(-0.1 * max(z_hr, 2)**2) *
+        math.exp(-0.1 * max(z_rr, 2)**2)
+    ) * 0.5
+
+    # P(vitals | critical) - very high z-scores or specific danger signs
+    likelihood_critical = 1.0 if (
+        vitals.oxygen_saturation < 88 or
+        vitals.heart_rate > 180 or
+        vitals.temperature < 35
+    ) else (likelihood_warning * 0.5)
+
+    # Bayesian update: P(regime | vitals) ∝ P(vitals | regime) * P(regime)
+    posterior_stable = likelihood_stable * prior_stable
+    posterior_caution = likelihood_caution * prior_caution
+    posterior_warning = likelihood_warning * prior_warning
+    posterior_critical = likelihood_critical * prior_critical
+
+    # Normalize
+    total = (
+        posterior_stable + posterior_caution + posterior_warning + posterior_critical
+    )
+    if total > 0:
+        posterior_stable /= total
+        posterior_caution /= total
+        posterior_warning /= total
+        posterior_critical /= total
+    else:
+        posterior_stable = 0.25
+        posterior_caution = 0.25
+        posterior_warning = 0.25
+        posterior_critical = 0.25
+
+    # Compute risk score from posterior distribution
+    risk_score = (
+        0.0 * posterior_stable +
+        0.33 * posterior_caution +
+        0.67 * posterior_warning +
+        1.0 * posterior_critical
+    )
+
+    regime_probs = {
+        "stable": posterior_stable,
+        "caution": posterior_caution,
+        "warning": posterior_warning,
+        "critical": posterior_critical,
+    }
+
+    # Confidence: how certain are we about this distribution?
+    # Higher entropy = lower confidence
+    entropy = -sum(p * math.log(p + 1e-6) for p in regime_probs.values())
+    max_entropy = math.log(4)  # Max entropy for 4 regimes
+    confidence = 1.0 - (entropy / max_entropy)
+
+    return RiskOutput(
+        engine_name="bayesian_fusion",
+        risk_score=risk_score,
+        confidence=confidence,
+        regime_classification=regime_probs,
+        triggered_rules=[
+            f"Z-scores: O2={z_o2:.2f}, HR={z_hr:.2f}, RR={z_rr:.2f}, Temp={z_temp:.2f}",
+            f"Posteriors: stable={posterior_stable:.2f}, caution={posterior_caution:.2f}, "
+            f"warning={posterior_warning:.2f}, critical={posterior_critical:.2f}",
+        ],
+        timestamp=datetime.now(timezone.utc),
+    )

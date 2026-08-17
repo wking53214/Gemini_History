@@ -1,0 +1,234 @@
+"""
+test_harness.py — Locks the causally-wired harness.
+
+Two kinds of test:
+  STRUCTURE/PLUMBING — the tree validates, clones, and re-sequences correctly;
+    traversal is deterministic; garbage is rejected.
+  CAUSAL CLAIMS — the properties that make the harness honest and useful:
+    sequence changes containment, emotion drives outcome, the route-intent-vs-
+    outcome gap (fake containment) actually occurs, and the planted reason-effect
+    is recoverable. If these break, the harness is no longer a faithful world and
+    the diagnostic engine built on it would be proving nothing.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import Counter, defaultdict
+
+import pytest
+
+from ivr_tree import IVRTree, Node, NodeKind, Option, Outcome
+from caller_model import PopulationGenerator, PopulationConfig
+from traversal import TraversalEngine, BehaviorParams
+from reference_tree import (
+    build_reference_tree, run_harness, containment_rate,
+    true_resolution_rate, fake_containment_rate,
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STRUCTURE / PLUMBING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_reference_tree_validates():
+    """The reference tree must build without a validation error (every edge points
+    at a real node, keys match ids)."""
+    tree = build_reference_tree()
+    assert tree.entry_id == "entry"
+    assert "agent" in tree.agent_node_ids()
+    print("PASS: reference tree validates")
+
+
+def test_tree_rejects_dangling_edge():
+    """A tree with an edge to a nonexistent node must raise at construction."""
+    nodes = {
+        "entry": Node("entry", NodeKind.MENU, options=[Option("x", "nowhere")]),
+    }
+    try:
+        IVRTree("entry", nodes)
+        assert False, "should have raised on dangling edge"
+    except ValueError:
+        pass
+    print("PASS: tree rejects dangling edge")
+
+
+def test_reorder_is_a_permutation_and_does_not_mutate_original():
+    """Re-sequencing returns a clone; the original menu order is unchanged, and a
+    non-permutation is rejected."""
+    tree = build_reference_tree()
+    original_order = [o.target_id for o in tree.node("entry").options]
+    moved = tree.move_option_to_end("entry", "agent")
+    assert [o.target_id for o in tree.node("entry").options] == original_order, "original mutated!"
+    assert moved.node("entry").options[-1].target_id == "agent"
+    with pytest.raises(ValueError):
+        tree.reorder_menu("entry", ["agent", "balance"])  # not a full permutation
+    print("PASS: reorder is a non-mutating permutation; bad order rejected")
+
+
+def test_traversal_is_deterministic():
+    """Same population, same tree, same seed -> identical journeys. The simulator
+    depends on this to attribute differences to STRUCTURE, not RNG."""
+    pop = PopulationGenerator(PopulationConfig(n=600, seed=3)).generate()
+    tree = build_reference_tree()
+    a = run_harness(pop, tree, seed=3)
+    b = run_harness(pop, tree, seed=3)
+    assert [j.outcome for j in a] == [j.outcome for j in b]
+    assert [j.path for j in a] == [j.path for j in b]
+    print("PASS: traversal is deterministic for fixed (population, tree, seed)")
+
+
+def test_population_is_reproducible():
+    """Same config -> same population (observed attributes identical)."""
+    p1 = PopulationGenerator(PopulationConfig(n=300, seed=5)).generate()
+    p2 = PopulationGenerator(PopulationConfig(n=300, seed=5)).generate()
+    assert [c.observed() for c in p1] == [c.observed() for c in p2]
+    print("PASS: population generation is reproducible")
+
+
+def test_disposition_is_hidden_from_observed():
+    """The observed() view must NOT leak the hidden disposition — the diagnostic
+    engine must reverse-engineer, not read the answer."""
+    pop = PopulationGenerator(PopulationConfig(n=10, seed=1)).generate()
+    obs = pop[0].observed()
+    assert "disposition" not in obs
+    assert "patience" not in obs
+    assert "base_temperature" not in obs
+    assert "self_serve_affinity" not in obs
+    print("PASS: hidden disposition does not leak into observed attributes")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CAUSAL CLAIMS (the properties that make the harness honest)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_sequence_changes_containment():
+    """THE CORE CLAIM: re-sequencing the tree changes containment on the SAME
+    population. Pushing the agent option last must not lower containment, and must
+    change the outcome distribution measurably."""
+    pop = PopulationGenerator(PopulationConfig(n=5000, seed=11)).generate()
+    tree = build_reference_tree()
+    base = run_harness(pop, tree, seed=11)
+    fixed = tree.move_option_to_end("entry", "agent")
+    after = run_harness(pop, fixed, seed=11)
+    base_c = containment_rate(base)
+    after_c = containment_rate(after)
+    # the intervention should help (or at least not hurt) containment
+    assert after_c >= base_c, f"pushing agent last lowered containment: {base_c:.3f} -> {after_c:.3f}"
+    # and it must actually CHANGE something (not a no-op)
+    assert after_c != base_c, "re-sequencing had zero effect — sequence is not causal"
+    print(f"PASS: sequence changes containment ({base_c:.1%} -> {after_c:.1%}, "
+          f"{(after_c-base_c)*100:+.1f}pt)")
+
+
+def test_emotion_drives_outcome():
+    """Hotter callers (hidden base temperature) must contain LESS and reach agents
+    MORE than cool callers through the same tree."""
+    pop = PopulationGenerator(PopulationConfig(n=8000, seed=11)).generate()
+    tree = build_reference_tree()
+    js = {j.caller_id: j for j in run_harness(pop, tree, seed=11)}
+    hot = [c for c in pop if c.disposition.base_temperature > 0.55]
+    cool = [c for c in pop if c.disposition.base_temperature < 0.35]
+    hot_c = sum(1 for c in hot if js[c.caller_id].contained) / len(hot)
+    cool_c = sum(1 for c in cool if js[c.caller_id].contained) / len(cool)
+    assert cool_c > hot_c + 0.05, f"emotion not driving outcome: cool {cool_c:.3f} vs hot {hot_c:.3f}"
+    print(f"PASS: emotion drives outcome (cool {cool_c:.1%} vs hot {hot_c:.1%} containment)")
+
+
+def test_fake_containment_actually_occurs():
+    """The route-intent-vs-outcome gap must be REAL in the data: some callers leave
+    automation 'contained' but unresolved. Without this there is no lie to catch."""
+    pop = PopulationGenerator(PopulationConfig(n=5000, seed=11)).generate()
+    tree = build_reference_tree()
+    js = run_harness(pop, tree, seed=11)
+    fake = fake_containment_rate(js)
+    assert fake > 0.01, f"fake containment absent ({fake:.3f}) — no route-intent-vs-outcome gap"
+    # and containment must exceed true resolution (the gap is visible at the top line)
+    assert containment_rate(js) > true_resolution_rate(js), \
+        "containment should exceed true resolution when fake containment exists"
+    print(f"PASS: fake containment occurs ({fake:.1%}); containment {containment_rate(js):.1%} "
+          f"> true resolution {true_resolution_rate(js):.1%}")
+
+
+def test_planted_reason_effect_is_recoverable():
+    """The planted truth (fraud/dispute run hot -> contain worse than balance/
+    payment) must be visible in the data — i.e. discoverable by the future engine."""
+    pop = PopulationGenerator(PopulationConfig(n=10000, seed=11)).generate()
+    tree = build_reference_tree()
+    js = {j.caller_id: j for j in run_harness(pop, tree, seed=11)}
+    by_reason = defaultdict(list)
+    for c in pop:
+        by_reason[c.reason].append(js[c.caller_id])
+    def cr(reason):
+        v = by_reason[reason]
+        return sum(1 for j in v if j.contained) / len(v)
+    hot_reasons = (cr("fraud") + cr("dispute")) / 2
+    calm_reasons = (cr("balance") + cr("payment")) / 2
+    assert calm_reasons > hot_reasons + 0.05, \
+        f"planted reason effect not recoverable: calm {calm_reasons:.3f} vs hot {hot_reasons:.3f}"
+    print(f"PASS: planted reason effect recoverable (calm reasons {calm_reasons:.1%} "
+          f"vs hot reasons {hot_reasons:.1%} containment)")
+
+
+def test_no_protected_effect_by_default():
+    """HONESTY/FAIRNESS: by default, the protected attribute must have NO material
+    effect on containment — so the fairness auditor can be tested for false alarms.
+    (A planted disparity is opt-in via plant_protected_bias=True.)"""
+    pop = PopulationGenerator(PopulationConfig(n=12000, seed=11)).generate()
+    tree = build_reference_tree()
+    js = {j.caller_id: j for j in run_harness(pop, tree, seed=11)}
+    prot = [c for c in pop if c.protected_group]
+    nonp = [c for c in pop if not c.protected_group]
+    prot_c = sum(1 for c in prot if js[c.caller_id].contained) / len(prot)
+    nonp_c = sum(1 for c in nonp if js[c.caller_id].contained) / len(nonp)
+    assert abs(prot_c - nonp_c) < 0.04, \
+        f"protected group shows a disparity by default: {prot_c:.3f} vs {nonp_c:.3f}"
+    print(f"PASS: no protected effect by default ({prot_c:.1%} vs {nonp_c:.1%}, within noise)")
+
+
+def test_planted_protected_bias_is_detectable_when_enabled():
+    """The opposite check: when plant_protected_bias=True, a disparity MUST appear,
+    so the future fairness engine has something real to catch."""
+    cfg = PopulationConfig(n=12000, seed=11, plant_protected_bias=True, protected_bias_strength=0.30)
+    pop = PopulationGenerator(cfg).generate()
+    tree = build_reference_tree()
+    js = {j.caller_id: j for j in run_harness(pop, tree, seed=11)}
+    prot = [c for c in pop if c.protected_group]
+    nonp = [c for c in pop if not c.protected_group]
+    prot_c = sum(1 for c in prot if js[c.caller_id].contained) / len(prot)
+    nonp_c = sum(1 for c in nonp if js[c.caller_id].contained) / len(nonp)
+    # planted bias makes the protected group hotter -> they contain LESS
+    assert nonp_c - prot_c > 0.03, \
+        f"planted protected disparity not detectable: {prot_c:.3f} vs {nonp_c:.3f}"
+    print(f"PASS: planted protected bias is detectable when enabled "
+          f"({prot_c:.1%} vs {nonp_c:.1%})")
+
+
+if __name__ == "__main__":
+    tests = [
+        test_reference_tree_validates,
+        test_tree_rejects_dangling_edge,
+        test_reorder_is_a_permutation_and_does_not_mutate_original,
+        test_traversal_is_deterministic,
+        test_population_is_reproducible,
+        test_disposition_is_hidden_from_observed,
+        test_sequence_changes_containment,
+        test_emotion_drives_outcome,
+        test_fake_containment_actually_occurs,
+        test_planted_reason_effect_is_recoverable,
+        test_no_protected_effect_by_default,
+        test_planted_protected_bias_is_detectable_when_enabled,
+    ]
+    print("=" * 70)
+    failures = 0
+    for t in tests:
+        try:
+            t()
+        except AssertionError as e:
+            failures += 1
+            print(f"FAIL: {t.__name__}: {e}")
+    print("=" * 70)
+    if failures:
+        print(f"{failures} FAILED of {len(tests)}")
+    else:
+        print(f"ALL {len(tests)} HARNESS TESTS PASSED")

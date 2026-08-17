@@ -1,0 +1,212 @@
+"""
+caller_model.py — The synthetic caller population for the harness.
+
+This is where the CAUSAL TRUTH is planted. The diagnostic engine, built later,
+will try to DISCOVER which caller attributes explain containment. For that test
+to be honest, the relationship has to be (a) real, (b) explicitly written down
+here, and (c) NOT trivially stamped on a single visible field — it must require
+the same reverse-engineering a real engagement requires.
+
+THE DESIGN PRINCIPLE: LATENT DISPOSITION, OBSERVED ATTRIBUTES
+------------------------------------------------------------
+A real caller has an internal disposition — how patient they are, how hot they
+arrive, how willing they are to self-serve — that we cannot see directly. What we
+CAN see (what a company's records hold) are observed attributes: age band, the
+product they hold, their tenure, their channel, prior contact count, language,
+region. In real life these attributes CORRELATE with disposition without BEING it.
+
+So this module:
+  1. Draws each caller a hidden disposition (patience, base_temperature,
+     self_serve_affinity).
+  2. Draws observed attributes that are correlated with that disposition through
+     rules written in plain language below.
+  3. Exposes ONLY the observed attributes plus the call's reason to the rest of
+     the system as "what the company knows," while the disposition stays hidden.
+
+This means the diagnostic engine cannot cheat by reading a "will_contain" flag.
+It has to find that, say, high-tenure customers holding product X who call about
+reason Y tend to bail — a pattern that exists because tenure and product
+correlate with disposition, exactly as in a real population. The grouping that
+explains behavior is discoverable but not obvious, which is the whole point.
+
+WHAT IS DELIBERATELY *NOT* WIRED TO IDENTITY BY DEFAULT
+-------------------------------------------------------
+By default, the disposition is driven by BEHAVIORAL/CONTEXTUAL correlates (tenure,
+product, prior contacts, reason) — never by a protected attribute. A protected-
+style attribute (here: `age_band`, and an optional `protected_group` marker) is
+generated but, by default, has NO causal effect on disposition. This lets the
+future fairness engine be tested two ways: confirm it finds NOTHING when there is
+no identity-driven pattern (no false alarm), and — by flipping `plant_protected_
+bias=True` — confirm it CATCHES a planted identity-linked disparity. The harness
+can create the disease on purpose so the auditor can be proven to detect it; it
+never ships that bias on by default.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, List, Optional
+
+import numpy as np
+
+
+# Observed attribute vocabularies (what "the company's records" contain).
+AGE_BANDS = ["18-29", "30-44", "45-59", "60-74", "75+"]
+PRODUCTS = ["basic", "plus", "premium", "legacy"]
+CHANNELS = ["IVR", "mobile", "web", "phone"]
+LANGUAGES = ["English", "Spanish"]
+REGIONS = ["NE", "SE", "MW", "SW", "W"]
+REASONS = ["balance", "payment", "dispute", "fraud", "tech_support", "account_change", "new_service"]
+
+
+@dataclass
+class Disposition:
+    """The caller's HIDDEN internal state drivers. Never exposed to the diagnostic
+    engine — only its downstream behavioral consequences are observable. All on
+    [0,1] unless noted.
+    """
+    patience: float            # tolerance for waiting/steps before hang-up/poundout
+    base_temperature: float    # how hot they arrive (0 calm .. 1 distressed)
+    self_serve_affinity: float # willingness to use automation vs. demand a human
+
+
+@dataclass
+class Caller:
+    """One synthetic caller: observed attributes (visible) + reason + hidden
+    disposition. `caller_id` is the join key, mirroring phone/account number."""
+    caller_id: str
+    # ---- observed attributes (what the company's records hold) ----
+    age_band: str
+    product: str
+    tenure_months: int
+    prior_contacts: int        # how many times they've called recently
+    channel: str
+    language: str
+    region: str
+    reason: str
+    # ---- optional protected marker (for fairness testing only) ----
+    protected_group: bool = False
+    # ---- HIDDEN: not exposed to the diagnostic engine ----
+    disposition: Optional[Disposition] = field(default=None, repr=False)
+
+    def observed(self) -> Dict[str, object]:
+        """The dict the rest of the system is allowed to see — observed attributes
+        and reason, NEVER the disposition. This is 'what the company knows.'"""
+        return {
+            "caller_id": self.caller_id,
+            "age_band": self.age_band,
+            "product": self.product,
+            "tenure_months": self.tenure_months,
+            "prior_contacts": self.prior_contacts,
+            "channel": self.channel,
+            "language": self.language,
+            "region": self.region,
+            "reason": self.reason,
+            "protected_group": self.protected_group,
+        }
+
+
+@dataclass
+class PopulationConfig:
+    """Knobs for generating a population. Documented so the planted causal
+    structure is explicit and auditable."""
+    n: int = 5000
+    seed: int = 7
+    # If True, plant a DISPARITY linked to the protected attribute so the fairness
+    # engine can be proven to catch it. OFF by default — the honest default is a
+    # population whose behavior is explained by behavioral/contextual factors only.
+    plant_protected_bias: bool = False
+    protected_fraction: float = 0.18      # share of callers marked protected_group
+    # strength of the (default-OFF) planted protected disparity, in temperature units
+    protected_bias_strength: float = 0.25
+
+
+class PopulationGenerator:
+    """Generates a caller population with a planted, documented causal structure
+    linking OBSERVED attributes -> HIDDEN disposition -> (later) behavior.
+
+    THE CORRELATION RULES (the planted truth the diagnostic engine must recover):
+      * base_temperature rises with `prior_contacts` — people who've called
+        repeatedly arrive hotter (they're already frustrated). [behavioral]
+      * base_temperature rises for reason in {fraud, dispute} — distressing
+        reasons run hot; {balance, payment} run calm. [contextual]
+      * self_serve_affinity rises with mobile/web channel and falls with phone —
+        channel choice reveals automation comfort. [behavioral]
+      * self_serve_affinity falls for product == 'legacy' — legacy-product holders
+        skew toward wanting a human (older relationship, complex accounts).
+      * patience falls as base_temperature rises, and falls slightly for very high
+        tenure (long-time customers feel entitled to fast service). [behavioral]
+      * age_band has NO causal effect by default (it is the protected-style
+        attribute used to test the fairness auditor).
+    Every one of these is behavioral/contextual, none is identity-based — which is
+    exactly the line the real system must hold.
+    """
+
+    def __init__(self, config: Optional[PopulationConfig] = None):
+        self.c = config or PopulationConfig()
+        self.rng = np.random.default_rng(self.c.seed)
+
+    def _clip01(self, x: float) -> float:
+        return float(min(1.0, max(0.0, x)))
+
+    def _make_disposition(self, *, prior_contacts: int, reason: str, channel: str,
+                          product: str, tenure_months: int, protected: bool) -> Disposition:
+        rng = self.rng
+        # base_temperature: noise + repeat-contact heat + reason heat
+        temp = 0.30 + 0.10 * rng.standard_normal()
+        temp += min(prior_contacts, 5) * 0.06            # repeat callers arrive hotter
+        if reason in ("fraud", "dispute"):
+            temp += 0.20                                  # distressing reasons run hot
+        elif reason in ("balance", "payment"):
+            temp -= 0.08                                  # routine reasons run calm
+        # OPTIONAL planted protected disparity (OFF by default): if enabled, the
+        # protected group is given a higher base temperature for NO legitimate
+        # reason — a pure identity-linked disparity for the auditor to catch.
+        if self.c.plant_protected_bias and protected:
+            temp += self.c.protected_bias_strength
+        temp = self._clip01(temp)
+
+        # self_serve_affinity: channel + product
+        aff = 0.50 + 0.12 * rng.standard_normal()
+        if channel in ("mobile", "web"):
+            aff += 0.18
+        elif channel == "phone":
+            aff -= 0.15
+        if product == "legacy":
+            aff -= 0.20
+        aff = self._clip01(aff)
+
+        # patience: falls with temperature and slightly with very high tenure
+        pat = 0.65 - 0.35 * temp + 0.10 * rng.standard_normal()
+        if tenure_months > 120:
+            pat -= 0.08
+        pat = self._clip01(pat)
+
+        return Disposition(patience=pat, base_temperature=temp, self_serve_affinity=aff)
+
+    def generate(self) -> List[Caller]:
+        rng = self.rng
+        callers: List[Caller] = []
+        for i in range(self.c.n):
+            # observed attributes (drawn first; some feed disposition)
+            age_band = AGE_BANDS[rng.integers(0, len(AGE_BANDS))]
+            product = PRODUCTS[rng.integers(0, len(PRODUCTS))]
+            tenure = int(max(0, rng.gamma(shape=2.0, scale=30.0)))   # skewed, mostly < 120mo
+            prior = int(rng.poisson(1.2))                            # most call 0-2 times
+            channel = CHANNELS[rng.integers(0, len(CHANNELS))]
+            language = LANGUAGES[0] if rng.random() < 0.93 else LANGUAGES[1]
+            region = REGIONS[rng.integers(0, len(REGIONS))]
+            reason = REASONS[rng.integers(0, len(REASONS))]
+            protected = rng.random() < self.c.protected_fraction
+
+            disp = self._make_disposition(
+                prior_contacts=prior, reason=reason, channel=channel,
+                product=product, tenure_months=tenure, protected=protected)
+
+            callers.append(Caller(
+                caller_id=f"C{i:06d}", age_band=age_band, product=product,
+                tenure_months=tenure, prior_contacts=prior, channel=channel,
+                language=language, region=region, reason=reason,
+                protected_group=protected, disposition=disp))
+        return callers

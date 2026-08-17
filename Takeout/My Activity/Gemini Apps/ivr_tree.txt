@@ -1,0 +1,225 @@
+"""
+ivr_tree.py — The configurable IVR structure that callers traverse.
+
+This is the shared spine of the whole system. The harness runs synthetic callers
+through a tree to GENERATE data; the simulation engine will later run a population
+through DIFFERENT arrangements of the same tree to MEASURE the effect of a change.
+Both need one representation, so it lives here, on its own, depending on nothing.
+
+WHY A TREE OF NODES WITH ORDERED OPTIONS
+----------------------------------------
+An IVR is the configurable front of a switchboard: a caller arrives at a gate,
+hears options in some ORDER, picks one, and is moved to the next gate or to a
+terminal outcome. The two things that matter for containment are (1) the STRUCTURE
+(which options exist, where they lead) and (2) the ORDER options are offered in,
+because order is itself a behavioral intervention (primacy, path-of-least-
+resistance, position-as-endorsement). So a node is fundamentally an ORDERED LIST
+of options, and re-sequencing a node means permuting that list. The whole thesis —
+"re-arrange the menu and change behavior" — is expressed as permuting option order
+and re-pointing edges, which is why the tree must be a mutable, copyable structure
+from the start, not a hard-coded flow.
+
+WHAT A NODE CAN BE
+------------------
+  MENU      : offers ordered options; the caller chooses one (or pounds out / hangs
+              up). The classic decision point.
+  SELF_SERVE: a self-service action (balance, reset, battery guide). May RESOLVE
+              (real containment) or FAIL (the route-intent-vs-outcome gap: looked
+              contained, actually bounced). Terminal-ish: success contains, failure
+              sends the caller onward (often angrier).
+  DATA_DIP  : a backend lookup mid-flow. Can be fast (invisible) or slow/failing
+              (dead air mid-self-service). Modeled because it is a real silent
+              containment-killer.
+  AUTH      : an authentication gate. Can succeed, or loop (repeat-auth pathology:
+              containment looks high while the experience fails).
+  AGENT     : the live-agent escape hatch. Reaching it is a CONTAINMENT FAILURE
+              (a call that needed a person). Present in almost every tree; the
+              question the thesis cares about is WHERE in the order it sits.
+  HANGUP    : a terminal representing the caller having abandoned. Not authored
+              into trees; it is where the traversal sends a caller who bails.
+
+This module has NO caller logic and NO randomness. It is pure structure. Caller
+behavior (how emotion drives the choice, when they pound out, whether a SELF_SERVE
+resolves) lives in the traversal engine, deliberately separated so the same tree
+can be driven by different behavioral models and so the structure can be reasoned
+about and re-sequenced without touching behavior.
+"""
+
+from __future__ import annotations
+
+import copy
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, List, Optional, Tuple
+
+
+class NodeKind(str, Enum):
+    MENU = "MENU"
+    SELF_SERVE = "SELF_SERVE"
+    DATA_DIP = "DATA_DIP"
+    AUTH = "AUTH"
+    AGENT = "AGENT"          # the escape hatch; reaching it = containment failure
+    HANGUP = "HANGUP"        # terminal: caller abandoned (not authored, used by traversal)
+
+
+# Outcomes a caller's journey can end in. Containment is the business's headline
+# metric, so the terminal taxonomy is built around it: did the call end without a
+# live agent (contained) or not, and if "contained," was it REAL or fake?
+class Outcome(str, Enum):
+    CONTAINED_RESOLVED = "CONTAINED_RESOLVED"      # self-served and actually resolved (true containment)
+    CONTAINED_UNRESOLVED = "CONTAINED_UNRESOLVED"  # left automation "handled" but problem not solved (fake containment; will likely call back)
+    AGENT = "AGENT"                                # reached a live agent (containment failure)
+    POUNDOUT = "POUNDOUT"                           # mashed zero out of annoyance -> heading to agent
+    HANGUP = "HANGUP"                               # abandoned before resolution (patience exceeded)
+
+
+@dataclass
+class Option:
+    """One ordered choice in a MENU node: a label and the node it leads to.
+
+    `intent_tag` is an OPTIONAL semantic label (e.g. "balance", "fraud", "agent")
+    used by the harness to decide which option a caller *wants*, and later by the
+    diagnostic engine. It is metadata about meaning, not behavior.
+    """
+    label: str
+    target_id: str
+    intent_tag: Optional[str] = None
+
+
+@dataclass
+class Node:
+    """A single routing point. The fields used depend on `kind`.
+
+    MENU       uses `options` (ORDERED — order is the lever).
+    SELF_SERVE uses `resolve_prob` (probability the action actually resolves; the
+               complement is the route-intent-vs-outcome gap), and `next_on_fail`.
+    DATA_DIP   uses `fail_prob` / `slow_prob` and `next_id` (where flow continues).
+    AUTH       uses `success_prob`, `max_attempts`, `next_on_success`.
+    AGENT/HANGUP are terminal.
+    """
+    node_id: str
+    kind: NodeKind
+    prompt: str = ""
+
+    # MENU
+    options: List[Option] = field(default_factory=list)
+
+    # SELF_SERVE
+    resolve_prob: float = 1.0          # P(actually resolves | reached). 1-this = fake-containment gap
+    next_on_fail: Optional[str] = None # where an unresolved self-serve caller goes (often AGENT)
+
+    # DATA_DIP
+    fail_prob: float = 0.0             # P(dip fails outright)
+    slow_prob: float = 0.0             # P(dip is slow -> dead air mid-flow, raises temperature)
+    next_id: Optional[str] = None      # where flow continues after the dip
+
+    # AUTH
+    success_prob: float = 1.0          # P(auth succeeds on a given attempt)
+    max_attempts: int = 3              # loop ceiling before bailing to agent
+    next_on_success: Optional[str] = None
+
+    def is_terminal(self) -> bool:
+        return self.kind in (NodeKind.AGENT, NodeKind.HANGUP)
+
+
+class IVRTree:
+    """A configurable IVR: a set of nodes, one entry point. Mutable and copyable.
+
+    Re-sequencing (the core intervention) is done by permuting a MENU node's
+    `options` list or re-pointing edges, then running the SAME population through
+    the modified copy to measure the change. `clone()` exists precisely so the
+    simulator can vary structure without mutating the original.
+    """
+
+    def __init__(self, entry_id: str, nodes: Dict[str, Node], name: str = "ivr"):
+        self.entry_id = entry_id
+        self.nodes = nodes
+        self.name = name
+        self._validate()
+
+    # ---- structure access ----
+
+    def node(self, node_id: str) -> Node:
+        if node_id not in self.nodes:
+            raise KeyError(f"IVRTree '{self.name}' has no node '{node_id}'")
+        return self.nodes[node_id]
+
+    def entry(self) -> Node:
+        return self.node(self.entry_id)
+
+    def clone(self) -> "IVRTree":
+        """A deep copy, so a structural change cannot leak back into the original.
+        The simulator relies on this to compare current-vs-variant honestly."""
+        return IVRTree(self.entry_id, copy.deepcopy(self.nodes), name=self.name)
+
+    # ---- re-sequencing primitives (the intervention surface) ----
+
+    def reorder_menu(self, node_id: str, new_order: List[str]) -> "IVRTree":
+        """Return a CLONE with one MENU node's options permuted into `new_order`
+        (a list of target_ids). The fundamental 're-arrange the menu' move.
+        Does not mutate self."""
+        clone = self.clone()
+        node = clone.node(node_id)
+        if node.kind is not NodeKind.MENU:
+            raise ValueError(f"node '{node_id}' is {node.kind}, cannot reorder options")
+        by_target = {o.target_id: o for o in node.options}
+        missing = set(by_target) ^ set(new_order)
+        if missing:
+            raise ValueError(f"new_order must be a permutation of existing targets; diff: {missing}")
+        node.options = [by_target[tid] for tid in new_order]
+        return clone
+
+    def move_option_to_end(self, node_id: str, target_id: str) -> "IVRTree":
+        """Return a CLONE with one option moved to the end of its menu — e.g.
+        pushing the AGENT option last, the canonical 'duh' containment fix."""
+        node = self.node(node_id)
+        order = [o.target_id for o in node.options if o.target_id != target_id]
+        order.append(target_id)
+        return self.reorder_menu(node_id, order)
+
+    # ---- validation ----
+
+    def _validate(self) -> None:
+        if self.entry_id not in self.nodes:
+            raise ValueError(f"entry_id '{self.entry_id}' not among nodes")
+        for nid, node in self.nodes.items():
+            if node.node_id != nid:
+                raise ValueError(f"node key '{nid}' != node_id '{node.node_id}'")
+            # every edge must point at a real node
+            edges: List[Tuple[str, Optional[str]]] = []
+            if node.kind is NodeKind.MENU:
+                for o in node.options:
+                    edges.append(("option", o.target_id))
+            if node.kind is NodeKind.SELF_SERVE:
+                edges.append(("next_on_fail", node.next_on_fail))
+            if node.kind is NodeKind.DATA_DIP:
+                edges.append(("next_id", node.next_id))
+            if node.kind is NodeKind.AUTH:
+                edges.append(("next_on_success", node.next_on_success))
+            for which, tid in edges:
+                if tid is not None and tid not in self.nodes:
+                    raise ValueError(f"node '{nid}' {which} -> unknown node '{tid}'")
+
+    # ---- introspection helpers (used by harness/diagnostic) ----
+
+    def menu_nodes(self) -> List[str]:
+        return [nid for nid, n in self.nodes.items() if n.kind is NodeKind.MENU]
+
+    def agent_node_ids(self) -> List[str]:
+        return [nid for nid, n in self.nodes.items() if n.kind is NodeKind.AGENT]
+
+    def describe(self) -> str:
+        lines = [f"IVRTree '{self.name}' (entry={self.entry_id}):"]
+        for nid, n in self.nodes.items():
+            head = f"  [{nid}] {n.kind.value}"
+            if n.kind is NodeKind.MENU:
+                opts = " | ".join(f"{i+1}.{o.label}->{o.target_id}" for i, o in enumerate(n.options))
+                head += f": {opts}"
+            elif n.kind is NodeKind.SELF_SERVE:
+                head += f": resolve_prob={n.resolve_prob}, on_fail->{n.next_on_fail}"
+            elif n.kind is NodeKind.DATA_DIP:
+                head += f": fail={n.fail_prob}, slow={n.slow_prob}, next->{n.next_id}"
+            elif n.kind is NodeKind.AUTH:
+                head += f": success={n.success_prob}, max={n.max_attempts}, ok->{n.next_on_success}"
+            lines.append(head)
+        return "\n".join(lines)
