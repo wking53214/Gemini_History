@@ -1,0 +1,75 @@
+{
+  "generated_at": "2026-08-17T19:25:23.171461",
+  "conversations": [
+    {
+      "id": "channel_table-01aae117854bcb6a",
+      "safe_id": "channel_table-01aae117854bcb6a",
+      "start_time": "",
+      "end_time": "",
+      "participants": [],
+      "message_count": 35,
+      "transcript": "transcripts/channel_table-01aae117854bcb6a.md",
+      "summary": "summaries/channel_table-01aae117854bcb6a.md"
+    },
+    {
+      "id": "demographics-01aae117854bcb6a",
+      "safe_id": "demographics-01aae117854bcb6a",
+      "start_time": "",
+      "end_time": "",
+      "participants": [],
+      "message_count": 1103,
+      "transcript": "transcripts/demographics-01aae117854bcb6a.md",
+      "summary": "summaries/demographics-01aae117854bcb6a.md"
+    },
+    {
+      "id": "ICD_codes_CI-6fca23b4cc3f9839",
+      "safe_id": "ICD_codes_CI-6fca23b4cc3f9839",
+      "start_time": "",
+      "end_time": "",
+      "participants": [],
+      "message_count": 2526,
+      "transcript": "transcripts/ICD_codes_CI-6fca23b4cc3f9839.md",
+      "summary": "summaries/ICD_codes_CI-6fca23b4cc3f9839.md"
+    },
+    {
+      "id": "component_inventory",
+      "safe_id": "component_inventory",
+      "start_time": "",
+      "end_time": "",
+      "participants": [],
+      "message_count": 418,
+      "transcript": "transcripts/component_inventory.md",
+      "summary": "summaries/component_inventory.md"
+    },
+    {
+      "id": "file_creation_timeline",
+      "safe_id": "file_creation_timeline",
+      "start_time": "",
+      "end_time": "",
+      "participants": [],
+      "message_count": 3,
+      "transcript": "transcripts/file_creation_timeline.md",
+      "summary": "summaries/file_creation_timeline.md"
+    },
+    {
+      "id": "content_date_inventory",
+      "safe_id": "content_date_inventory",
+      "start_time": "",
+      "end_time": "",
+      "participants": [],
+      "message_count": 2480,
+      "transcript": "transcripts/content_date_inventory.md",
+      "summary": "summaries/content_date_inventory.md"
+    },
+    {
+      "id": "artifact_inventory",
+      "safe_id": "artifact_inventory",
+      "start_time": "",
+      "end_time": "",
+      "participants": [],
+      "message_count": 228,
+      "transcript": "transcripts/artifact_inventory.md",
+      "summary": "summaries/artifact_inventory.md"
+    }
+  ]
+}
